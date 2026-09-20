@@ -1,12 +1,11 @@
-# Python deps to RUN the exploit (orchestrate.py).  Install:  python -m pip install -r requirements.txt
-#   (use `python -m pip` so it lands in the same interpreter that runs `python orchestrate.py`)
+# RUN the exploit (orchestrate.py): NO required packages.
+# orchestrate.py has a built-in, self-contained pure-Python AES-128 fallback (verified vs
+# pycryptodome + FIPS-197), so it runs on any Python with zero third-party deps — no pip install,
+# no C compiler. `pip install -r requirements.txt` here is intentionally a no-op.
 #
-# Provides Crypto.Cipher.AES (the Dirty-Frag keystream). This is the ONLY Python dep for running.
-pycryptodome>=3.15
-
-# To ADD a new firmware target (port.py) you also need vmlinux-to-elf — see requirements-port.txt.
-# It is intentionally NOT here: its minilzo sub-dep needs a C compiler on Windows, which would break
-# `pip install -r requirements.txt` for people who only want to run the exploit.
+# OPTIONAL speedup (uses the C-accelerated AES instead of the pure fallback — a few seconds faster
+# per run). Only install if you already have wheels/a compiler; skip it on bleeding-edge Pythons:
+#   python -m pip install pycryptodome
 #
-# Non-pip tools (see SETUP.md): adb (platform-tools), LLVM/clang, and for port.py also
-# payload-dumper-go + debugfs.
+# To ADD a new firmware target (port.py) you need vmlinux-to-elf — see requirements-port.txt.
+# Non-pip tools (SETUP.md): adb, LLVM/clang, and for port.py also payload-dumper-go + debugfs.

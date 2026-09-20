@@ -10,7 +10,7 @@ the ones for what you'll run, then point `toolconf.py` (or env vars) at them.
 | Tool | Needed by | `toolconf.py` / env var | Notes |
 |------|-----------|-------------------------|-------|
 | **Python 3.8+** | everything | — | run scripts with `python` / `python3` |
-| **pycryptodome** | `orchestrate.py` | — (pip) | provides `Crypto.Cipher.AES` (keystream) |
+| **pycryptodome** | `orchestrate.py` (OPTIONAL) | — (pip) | speedup only; a pure-Python AES fallback is built in, so it's not required |
 | **adb** (platform-tools) | `orchestrate.py`, `port.py --device` | on PATH | Google platform-tools |
 | **LLVM/clang** (`clang`, `llvm-objcopy`, `llvm-readelf`, `llvm-nm`) | `orchestrate.py`, `build_credmod.py`, `port.py` | `AOSP_CLANG_BIN` (the `bin/` dir) | ≥ v14; AOSP clang **or** stock LLVM — only assembles AArch64 asm |
 | **payload-dumper-go** | `port.py` | `PAYLOAD_DUMPER` (full path to the binary) | extracts OTA partitions |
@@ -18,7 +18,8 @@ the ones for what you'll run, then point `toolconf.py` (or env vars) at them.
 | **vmlinux-to-elf** | `port.py` | `VMLINUX_TO_ELF` (default: `vmlinux-to-elf` on PATH) | boot.img → vmlinux with symbols |
 | Android **NDK** | *only* rebuilding `e2e.dex`/native (optional) | `NDK_BIN` | `e2e.dex` is prebuilt & committed — skip unless changing the Java |
 
-**Minimum to run the exploit** (`orchestrate.py`): Python + pycryptodome + adb + LLVM/clang.
+**Minimum to run the exploit** (`orchestrate.py`): Python + adb + LLVM/clang. (pycryptodome is an
+optional speedup — orchestrate.py falls back to a built-in pure-Python AES.)
 **To add a new firmware target** (`port.py`): also payload-dumper-go + debugfs + vmlinux-to-elf.
 
 ---
@@ -27,7 +28,8 @@ the ones for what you'll run, then point `toolconf.py` (or env vars) at them.
 
 ```bash
 # Python libs
-python3 -m pip install --user -r requirements.txt              # RUN the exploit (pycryptodome)
+# RUN the exploit needs NO pip packages (built-in pure-Python AES). Optional speedup:
+python3 -m pip install --user pycryptodome                      # optional
 python3 -m pip install --user -r requirements-port.txt         # only to ADD targets (vmlinux-to-elf)
 
 # distro packages
@@ -59,9 +61,9 @@ Install (PowerShell; `winget` or manual downloads):
 ```powershell
 winget install Python.Python.3.12
 winget install LLVM.LLVM                        # -> C:\Program Files\LLVM\bin (clang.exe, llvm-*.exe)
-python -m pip install -r requirements.txt          # RUN the exploit (pycryptodome only)
-# python -m pip install -r requirements-port.txt   # ONLY to add targets; its minilzo dep needs MSVC
-#                                                  #   build tools on Windows -> prefer porting under WSL
+# RUN the exploit needs NO pip packages (built-in pure-Python AES).
+# python -m pip install pycryptodome               # OPTIONAL speedup (skip on Python 3.14 / no MSVC)
+# python -m pip install -r requirements-port.txt   # ONLY to add targets; minilzo needs MSVC -> use WSL
 ```
 - **adb**: download *SDK Platform-Tools for Windows* from
   https://developer.android.com/tools/releases/platform-tools , unzip (e.g. `C:\platform-tools`),
@@ -85,7 +87,7 @@ $env:DEBUGFS        = "C:\cygwin64\bin\debugfs.exe"   # only if not using WSL
 > `AOSP_CLANG_BIN` just needs to be the `bin` directory.
 
 > **Recommended split:** run **`orchestrate.py` natively on Windows** (needs only Python +
-> pycryptodome + adb + LLVM — all easy on Windows), and do the occasional **`port.py` under WSL**
+> adb + LLVM — no pip packages; pycryptodome optional), and do the occasional **`port.py` under WSL**
 > (where debugfs/vmlinux-to-elf/payload-dumper are trivial). Targets are just JSON + a few small
 > files, so build them once (either OS) and commit them.
 
@@ -101,7 +103,7 @@ import toolconf as t
 def ok(label, path, run=None):
     found = os.path.isfile(path) or shutil.which(path)
     print(f"  {'OK ' if found else 'MISSING'} {label}: {path}")
-print("Crypto (pycryptodome):", "OK" if importlib.util.find_spec("Crypto") else "MISSING  (pip install pycryptodome)")
+print("pycryptodome (optional speedup):", "OK" if importlib.util.find_spec("Crypto") else "absent — using built-in pure-Python AES (fine)")
 print("adb:", "OK" if shutil.which("adb") else "MISSING")
 for lbl, p in [("clang", t.CLANG), ("llvm-objcopy", t.OBJCOPY), ("llvm-readelf", t.READELF),
                ("llvm-nm", t.NM), ("payload-dumper-go", t.PDG), ("debugfs", t.DEBUGFS),
