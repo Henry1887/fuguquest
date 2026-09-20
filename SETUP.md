@@ -12,14 +12,15 @@ the ones for what you'll run, then point `toolconf.py` (or env vars) at them.
 | **Python 3.8+** | everything | — | run scripts with `python` / `python3` |
 | **pycryptodome** | `orchestrate.py` (OPTIONAL) | — (pip) | speedup only; a pure-Python AES fallback is built in, so it's not required |
 | **adb** (platform-tools) | `orchestrate.py`, `port.py --device` | on PATH | Google platform-tools |
-| **LLVM/clang** (`clang`, `llvm-objcopy`, `llvm-readelf`, `llvm-nm`) | `orchestrate.py`, `build_credmod.py`, `port.py` | `AOSP_CLANG_BIN` (the `bin/` dir) | ≥ v14; AOSP clang **or** stock LLVM — only assembles AArch64 asm |
+| **clang** | `orchestrate.py`, `build_credmod.py`, `port.py` | `AOSP_CLANG_BIN` (the `bin/` dir) | ≥ v14; only assembles AArch64 asm. Running needs ONLY clang (ELF read is pure-Python). |
+| **llvm-readelf**, **llvm-nm** | `port.py` only | `AOSP_CLANG_BIN` | for adding targets; not needed to run |
 | **payload-dumper-go** | `port.py` | `PAYLOAD_DUMPER` (full path to the binary) | extracts OTA partitions |
 | **debugfs** (e2fsprogs) | `port.py` | `DEBUGFS` (default: `debugfs` on PATH) | reads files out of ext4 partition images |
 | **vmlinux-to-elf** | `port.py` | `VMLINUX_TO_ELF` (default: `vmlinux-to-elf` on PATH) | boot.img → vmlinux with symbols |
 | Android **NDK** | *only* rebuilding `e2e.dex`/native (optional) | `NDK_BIN` | `e2e.dex` is prebuilt & committed — skip unless changing the Java |
 
-**Minimum to run the exploit** (`orchestrate.py`): Python + adb + LLVM/clang. (pycryptodome is an
-optional speedup — orchestrate.py falls back to a built-in pure-Python AES.)
+**Minimum to run the exploit** (`orchestrate.py`): Python + adb + **clang** (just clang — ELF
+parsing is pure-Python, so llvm-objcopy/readelf/nm are NOT needed). pycryptodome is an optional speedup.
 **To add a new firmware target** (`port.py`): also payload-dumper-go + debugfs + vmlinux-to-elf.
 
 ---
@@ -105,12 +106,12 @@ def ok(label, path, run=None):
     print(f"  {'OK ' if found else 'MISSING'} {label}: {path}")
 print("pycryptodome (optional speedup):", "OK" if importlib.util.find_spec("Crypto") else "absent — using built-in pure-Python AES (fine)")
 print("adb:", "OK" if shutil.which("adb") else "MISSING")
-for lbl, p in [("clang", t.CLANG), ("llvm-objcopy", t.OBJCOPY), ("llvm-readelf", t.READELF),
-               ("llvm-nm", t.NM), ("payload-dumper-go", t.PDG), ("debugfs", t.DEBUGFS),
-               ("vmlinux-to-elf", t.VMLINUX_TO_ELF)]:
+ok("clang (required to run)", t.CLANG)
+for lbl, p in [("llvm-readelf [port.py]", t.READELF), ("llvm-nm [port.py]", t.NM),
+               ("payload-dumper-go [port.py]", t.PDG), ("debugfs [port.py]", t.DEBUGFS),
+               ("vmlinux-to-elf [port.py]", t.VMLINUX_TO_ELF)]:
     ok(lbl, p)
 PY
 ```
-Anything `MISSING` → install it or fix its path in `toolconf.py` / the matching env var. `debugfs`,
-`payload-dumper-go`, and `vmlinux-to-elf` are only needed for `port.py` (adding targets), not for
-running the exploit.
+To RUN the exploit only **clang** must be OK. `llvm-readelf`/`llvm-nm`/`debugfs`/`payload-dumper-go`/
+`vmlinux-to-elf` are only for `port.py` (adding targets). Fix any run-blocker via `toolconf.py` / env.

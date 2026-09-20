@@ -120,6 +120,7 @@ so only ~48 bytes need poisoning and the whole IV table fits libeva's existing g
 - `SETUP.md`         — external-dependency install for Linux & Windows + environment self-check
 - `requirements.txt` — running needs NO pip packages (built-in pure-Python AES; pycryptodome
   optional speedup); add-target extra in `requirements-port.txt`
+- `elfutil.py`       — tiny pure-Python ELF reader so running needs only clang (no objcopy/readelf)
 - `toolconf.py`      — ONE place for all external tool paths (clang/objcopy/readelf/nm, NDK,
   payload-dumper, debugfs, vmlinux-to-elf); env vars override. Imported by the scripts below.
 - `port.py`          — gather a new firmware's values → draft `targets/<name>.json` (+ binaries);
