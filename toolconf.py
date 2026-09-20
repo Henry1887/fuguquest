@@ -8,7 +8,7 @@
 #   PAYLOAD_DUMPER   payload-dumper-go binary                      (port.py partition extract)
 #   DEBUGFS          debugfs binary                                (port.py ext image extract)
 #   VMLINUX_TO_ELF   vmlinux-to-elf binary                         (port.py kernel symbols)
-import os
+import os, shutil
 
 # --- toolchain bin directories -------------------------------------------------------------------
 # AOSP clang (aarch64-linux-gnu): builds the carrier .ko diff patches + injection/cred asm.
@@ -17,18 +17,29 @@ CLANG_BIN = os.environ.get("AOSP_CLANG_BIN", "/home/henry/Tools/aosp-clang/clang
 NDK_BIN   = os.environ.get("NDK_BIN",
     "/home/henry/Tools/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin")
 
-# --- individual tools (derived from the bin dirs; the four the scripts actually invoke) -----------
+# --- resolver: prefer the configured bin dir, else fall back to the tool on PATH ------------------
+# So it "just works" if clang/llvm are installed and on PATH (e.g. `winget install LLVM.LLVM`) even
+# when AOSP_CLANG_BIN still points at the default. `.exe` is added on Windows. If nothing is found,
+# the configured path is returned so the eventual error names the expected location.
 def _tool(bindir, name):
-    p = os.path.join(bindir, name)
-    return p + ".exe" if os.name == "nt" and not p.lower().endswith(".exe") else p   # Windows: clang.exe etc.
+    exe = name + ".exe" if os.name == "nt" else name
+    cand = os.path.join(bindir, exe)
+    if os.path.isfile(cand): return cand
+    return shutil.which(name) or shutil.which(exe) or cand
+
+def _bin(envvar, default, name):   # standalone binary: env path -> configured -> PATH -> name
+    p = os.environ.get(envvar, default)
+    if os.path.isfile(p): return p
+    return shutil.which(p) or shutil.which(name) or p
+
+# --- individual tools (the ones the scripts actually invoke) --------------------------------------
 CLANG     = _tool(CLANG_BIN, "clang")
 OBJCOPY   = _tool(CLANG_BIN, "llvm-objcopy")
 READELF   = _tool(CLANG_BIN, "llvm-readelf")
 NM        = _tool(CLANG_BIN, "llvm-nm")
 NDK_CLANG = _tool(NDK_BIN, "aarch64-linux-android30-clang")
 
-# --- standalone binaries (PATH name by default; override with an absolute path via env) -----------
-PDG            = os.environ.get("PAYLOAD_DUMPER",
-    "/home/henry/Tools/payload-dumper-go_1.3.0_linux_amd64/payload-dumper-go")
-DEBUGFS        = os.environ.get("DEBUGFS", "debugfs")
-VMLINUX_TO_ELF = os.environ.get("VMLINUX_TO_ELF", "vmlinux-to-elf")
+# --- standalone binaries (env path, else PATH) ---------------------------------------------------
+PDG            = _bin("PAYLOAD_DUMPER", "/home/henry/Tools/payload-dumper-go_1.3.0_linux_amd64/payload-dumper-go", "payload-dumper-go")
+DEBUGFS        = _bin("DEBUGFS", "debugfs", "debugfs")
+VMLINUX_TO_ELF = _bin("VMLINUX_TO_ELF", "vmlinux-to-elf", "vmlinux-to-elf")

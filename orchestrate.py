@@ -668,8 +668,19 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
         info("device is Permissive with a root-capable module loaded; run again with --postex/--adb-root.")
         warn("residue (needs reboot): carrier/cfg page-cache poison + loaded carrier module")
 
+def require_toolchain():
+    import shutil
+    for tool, label in ((CLANG, "clang"), (OBJCOPY, "llvm-objcopy"), (READELF, "llvm-readelf")):
+        if not (os.path.isfile(tool) or shutil.which(tool)):
+            err(f"{label} not found: {tool}")
+            warn("Install LLVM/clang and set AOSP_CLANG_BIN (or put it on PATH) — see SETUP.md:")
+            warn("  Windows:  winget install LLVM.LLVM   then  set AOSP_CLANG_BIN=C:\\Program Files\\LLVM\\bin")
+            warn("  Linux:    dnf/apt install clang llvm  (AOSP_CLANG_BIN=/usr/bin)")
+            sys.exit(1)
+
 def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=False):
     tgt = json.load(open(target_path))
+    require_toolchain()          # fail fast with a clear message before staging anything
     if tgt["kernel"].get("merged"):
         return run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk)
     tdir = os.path.join(HERE, "targets")
