@@ -1,0 +1,7 @@
+# generated build artifacts (orchestrate.py / port.py / build_credmod.py write here or to /tmp)
+build/
+__pycache__/
+*.pyc
+*.o
+*.bin
+*.spec

