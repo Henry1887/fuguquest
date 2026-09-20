@@ -23,7 +23,7 @@ the ones for what you'll run, then point `toolconf.py` (or env vars) at them.
 
 ```bash
 # Python libs
-python3 -m pip install --user pycryptodome vmlinux-to-elf
+python3 -m pip install --user -r requirements.txt   # pycryptodome (+ vmlinux-to-elf for port.py)
 
 # distro packages
 #  Fedora:
@@ -54,7 +54,7 @@ Install (PowerShell; `winget` or manual downloads):
 ```powershell
 winget install Python.Python.3.12
 winget install LLVM.LLVM                        # -> C:\Program Files\LLVM\bin (clang.exe, llvm-*.exe)
-python -m pip install pycryptodome vmlinux-to-elf
+python -m pip install -r requirements.txt   # pycryptodome (+ vmlinux-to-elf for port.py)
 ```
 - **adb**: download *SDK Platform-Tools for Windows* from
   https://developer.android.com/tools/releases/platform-tools , unzip (e.g. `C:\platform-tools`),
