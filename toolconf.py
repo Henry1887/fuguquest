@@ -18,11 +18,14 @@ NDK_BIN   = os.environ.get("NDK_BIN",
     "/home/henry/Tools/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin")
 
 # --- individual tools (derived from the bin dirs; the four the scripts actually invoke) -----------
-CLANG     = os.path.join(CLANG_BIN, "clang")
-OBJCOPY   = os.path.join(CLANG_BIN, "llvm-objcopy")
-READELF   = os.path.join(CLANG_BIN, "llvm-readelf")
-NM        = os.path.join(CLANG_BIN, "llvm-nm")
-NDK_CLANG = os.path.join(NDK_BIN, "aarch64-linux-android30-clang")
+def _tool(bindir, name):
+    p = os.path.join(bindir, name)
+    return p + ".exe" if os.name == "nt" and not p.lower().endswith(".exe") else p   # Windows: clang.exe etc.
+CLANG     = _tool(CLANG_BIN, "clang")
+OBJCOPY   = _tool(CLANG_BIN, "llvm-objcopy")
+READELF   = _tool(CLANG_BIN, "llvm-readelf")
+NM        = _tool(CLANG_BIN, "llvm-nm")
+NDK_CLANG = _tool(NDK_BIN, "aarch64-linux-android30-clang")
 
 # --- standalone binaries (PATH name by default; override with an absolute path via env) -----------
 PDG            = os.environ.get("PAYLOAD_DUMPER",

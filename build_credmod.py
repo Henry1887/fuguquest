@@ -10,7 +10,7 @@
 # (KASLR-slid) symbol address there at load time. We read it as data -> pdr. CALL26 can't be used
 # because the loader routes out-of-range module calls through a PLT veneer (Quest Pro 4.19), so a
 # runtime bl-decode would yield the veneer address, not __platform_driver_register (-> panic).
-import struct, subprocess, sys, os
+import struct, subprocess, sys, os, tempfile, shutil, atexit
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from toolconf import CLANG, OBJCOPY, READELF   # central tool locations (edit toolconf.py / set env)
@@ -41,7 +41,9 @@ CTX = """    // context = kernel (SECINITSID_KERNEL=1) : cred->security = task_s
 # --- assemble the template (substitute per-target struct offsets) ---
 tmpl = open(os.path.join(HERE, "asm", "cred_patch.S.tmpl")).read()
 src = tmpl.replace("@ENF_OFF@", str(enf_off)).replace("@CRED_OFF@", hex(cred_off)).replace("@CTX@", CTX)
-s = "/tmp/cred_patch.S"; o = "/tmp/cred_patch.o"; b = "/tmp/cred_patch.bin"
+_td = tempfile.mkdtemp(prefix="credmod_")           # cross-OS temp (%TEMP% on Windows, /tmp on Linux)
+atexit.register(lambda: shutil.rmtree(_td, ignore_errors=True))
+s = os.path.join(_td, "cred_patch.S"); o = os.path.join(_td, "cred_patch.o"); b = os.path.join(_td, "cred_patch.bin")
 open(s, "w").write(src)
 subprocess.run([CLANG, "-target", "aarch64-linux-gnu", "-c", s, "-o", o], check=True, capture_output=True)
 subprocess.run([OBJCOPY, "-O", "binary", "--only-section=.patch", o, b], check=True)

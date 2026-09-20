@@ -21,11 +21,13 @@ sys.path.insert(0, HERE)
 from toolconf import READELF, NM, PDG, DEBUGFS, VMLINUX_TO_ELF   # central tool locations (edit toolconf.py / set env)
 R_AARCH64_CALL26 = 0x11b
 
-def sh(c): return subprocess.run(c, shell=True, capture_output=True, text=True).stdout
+def run(args): return subprocess.run(args, capture_output=True, text=True).stdout   # arg list, no shell (OS-independent)
 def die(m): print("ERROR:", m); sys.exit(1)
 
 def dump_partitions(zippath, workdir, parts):
-    sh(f"cd {workdir} && unzip -o {zippath} payload.bin >/dev/null 2>&1")
+    import zipfile                                          # extract payload.bin cross-OS (no `unzip`)
+    with zipfile.ZipFile(zippath) as z:
+        z.extract("payload.bin", workdir)
     subprocess.run([PDG, "-p", ",".join(parts), "-o", workdir,
                     os.path.join(workdir, "payload.bin")], capture_output=True)
 
@@ -36,7 +38,7 @@ def debugfs_dump(img, inner, outp):
 def carrier_anchor_symbol(ko):
     # the CALL26 target inside .rela.init.text (this is what build_carrier repoints to 0x14,
     # so DELTA must be selinux_state - <this symbol>). Ignore CALL26s in other sections (CFI etc).
-    out = sh(f"{READELF} -r {ko}")
+    out = run([READELF, "-r", ko])
     for blk in ("Relocation section '" + s for s in out.split("Relocation section '")[1:]):
         if blk.startswith("Relocation section '.rela.init.text'"):
             m = re.search(r"CALL26\s+\S+\s+(\S+)", blk)
@@ -63,7 +65,7 @@ def find_module(workdir, name, imgs):
 def init_array_and_ctor(libeva):
     d = open(libeva, "rb").read()
     off = None
-    for l in sh(f"{READELF} -S {libeva}").splitlines():
+    for l in run([READELF, "-S", libeva]).splitlines():
         if ".init_array" in l:
             off = int(l.split()[4], 16); break
     if off is None: die("no .init_array in libeva")
@@ -83,12 +85,12 @@ def find_gap(libeva, need=1720):
         p_filesz, = struct.unpack_from("<Q", d, p + 32)
         if p_type != 1 or not (p_flags & 1): continue          # PT_LOAD + X
         seg = d[p_off:p_off + p_filesz]
-        run = 0
+        zrun = 0
         for j, b in enumerate(seg):
             if b == 0:
-                run += 1
-                if run > best[1]: best = (p_off + j - run + 1, run)
-            else: run = 0
+                zrun += 1
+                if zrun > best[1]: best = (p_off + j - zrun + 1, zrun)
+            else: zrun = 0
     start, size = best
     start = (start + 7) & ~7                                    # 8-byte align
     size -= (start - best[0])
@@ -96,7 +98,7 @@ def find_gap(libeva, need=1720):
     return start, size
 
 def dump_sym(lib, needle):
-    for l in sh(f"{READELF} -sW {lib}").splitlines():
+    for l in run([READELF, "-sW", lib]).splitlines():
         if needle in l:
             f = l.split(); return int(f[1], 16), int(f[2])
     return None, None
@@ -122,7 +124,7 @@ def main():
     ap.add_argument("--cred-security-off", default="0x78",
                     help="cred->security offset for --adb-root's kernel-context patch (0x78 on 5.10 & 4.19)")
     a = ap.parse_args()
-    a.zip = os.path.abspath(a.zip)   # dump_partitions cd's into workdir; zip path must be absolute
+    a.zip = os.path.abspath(a.zip)   # absolute so it resolves regardless of the scratch workdir
     # naming scheme: target name == the OTA zip basename (e.g. QPro_51483620027600340, q3_<build>)
     a.name = a.name or os.path.splitext(os.path.basename(a.zip))[0]
     tdir = os.path.join(HERE, "targets", a.name); os.makedirs(tdir, exist_ok=True)
@@ -146,10 +148,10 @@ def main():
     if not (debugfs_dump(os.path.join(wd, "vendor.img"), "/etc/init.insmod.cfg", cfg)
             or debugfs_dump(os.path.join(wd, "vendor_dlkm.img"), "/etc/init.insmod.cfg", cfg)):
         die("init.insmod.cfg not found")
-    vermagic = re.search(r"vermagic=(\S+)", sh(f"strings -a {ko}")).group(1)
+    vermagic = re.search(rb"vermagic=(\S+)", open(ko,"rb").read()).group(1).decode()
     anchor = a.anchor
     # the carrier's init must call the anchor (build_credmod/build_carrier repoint that CALL26).
-    car_relas = sh(f"{READELF} -r {ko}").split("rela.init.text", 1)[-1].split("Relocation section", 1)[0]
+    car_relas = run([READELF, "-r", ko]).split("rela.init.text", 1)[-1].split("Relocation section", 1)[0]
     if anchor not in car_relas:
         print(f"[!] carrier init has no {anchor} CALL26 — pick --anchor from its .rela.init.text")
     print(f"    carrier vermagic={vermagic}  anchor={anchor}")
@@ -159,7 +161,7 @@ def main():
         credko = find_module(wd, a.cred_carrier, IMGS)
         if not credko: die(f"cred carrier {a.cred_carrier}.ko not found")
         shutil.copy(credko, os.path.join(tdir, f"{a.cred_carrier}.ko"))
-        cred_relas = sh(f"{READELF} -r {credko}").split("rela.init.text", 1)[-1].split("Relocation section", 1)[0]
+        cred_relas = run([READELF, "-r", credko]).split("rela.init.text", 1)[-1].split("Relocation section", 1)[0]
         if anchor not in cred_relas:
             print(f"[!] cred carrier init has no {anchor} CALL26 — build_credmod will fail")
 
@@ -168,7 +170,7 @@ def main():
     subprocess.run([VMLINUX_TO_ELF, os.path.join(wd, "boot.img"), vm], capture_output=True)
     want = ("selinux_state", anchor, "find_vpid", "pid_task", "selinux_status_update_setenforce")
     syms = {}
-    for l in sh(f"{NM} {vm}").splitlines():
+    for l in run([NM, vm]).splitlines():
         f = l.split()
         if len(f) == 3 and f[2] in want: syms[f[2]] = int(f[0], 16)
     miss = [s for s in want if s not in syms]
