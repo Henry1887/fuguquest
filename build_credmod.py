@@ -94,6 +94,21 @@ for i in range(n):
     elif r_off < len(patch):
         struct.pack_into("<Q", d, e + 8, 0)                             # -> R_AARCH64_NONE
 assert repointed == 1, "did not find __platform_driver_register CALL26 anchor"
+
+# neutralize module_exit: we hijacked init (the carrier's real init never ran), so its real
+# cleanup_module would tear down never-initialized state on rmmod -> crash (rdbg NULL-derefs at
+# rmmod). Splice a bare `ret` at .exit.text[0] so rmmod is a clean no-op, and NONE any reloc there.
+if ".exit.text" in byname:
+    et = byname[".exit.text"]
+    if et["size"] >= 4:
+        struct.pack_into("<I", d, et["off"], 0xd65f03c0)                # ret
+        if ".rela.exit.text" in byname:
+            er = byname[".rela.exit.text"]
+            for i in range(er["size"] // 24):
+                e = er["off"] + i * 24
+                r_off, = struct.unpack_from("<Q", d, e)
+                if r_off < 4: struct.pack_into("<Q", d, e + 8, 0)       # -> R_AARCH64_NONE
+
 open(out, "wb").write(d)
 diffs = sum(1 for i in range(len(d)) if d[i] != bytearray(open(carrier, "rb").read())[i])
 print(f"{out}: patch {len(patch)}B, anchor@0x{anchor_off:x}, {diffs} diff bytes, pid={pid} "
