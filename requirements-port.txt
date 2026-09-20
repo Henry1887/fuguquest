@@ -1,0 +1,9 @@
+# Extra Python dep to ADD a new firmware target with port.py (NOT needed to run the exploit).
+#   python -m pip install -r requirements-port.txt
+#
+# vmlinux-to-elf turns a boot.img into a vmlinux with symbols (for the kernel deltas).
+# WINDOWS NOTE: it pulls in `minilzo`, which builds a C extension and needs "Microsoft C++ Build
+# Tools" (https://visualstudio.microsoft.com/visual-cpp-build-tools/). Easiest is to run port.py
+# under WSL instead (`sudo apt install e2fsprogs` there too) — see SETUP.md. Targets are just JSON +
+# a couple small files, so build them once anywhere and commit them.
+vmlinux-to-elf>=0.1

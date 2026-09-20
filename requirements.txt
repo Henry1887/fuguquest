@@ -1,11 +1,12 @@
-# Python dependencies for the DirtyFrag-LPE toolkit.  Install:  pip install -r requirements.txt
+# Python deps to RUN the exploit (orchestrate.py).  Install:  python -m pip install -r requirements.txt
+#   (use `python -m pip` so it lands in the same interpreter that runs `python orchestrate.py`)
 #
-# Required to RUN the exploit (orchestrate.py) — provides Crypto.Cipher.AES (Dirty-Frag keystream):
+# Provides Crypto.Cipher.AES (the Dirty-Frag keystream). This is the ONLY Python dep for running.
 pycryptodome>=3.15
 
-# Only needed to ADD a firmware target (port.py); installs the `vmlinux-to-elf` command
-# (boot.img -> vmlinux with symbols). Skip if you only run orchestrate.py.
-vmlinux-to-elf>=0.1
-
-# NOT pip-installable — see SETUP.md: adb (platform-tools), LLVM/clang (llvm-objcopy/readelf/nm),
-# payload-dumper-go, debugfs (e2fsprogs).
+# To ADD a new firmware target (port.py) you also need vmlinux-to-elf — see requirements-port.txt.
+# It is intentionally NOT here: its minilzo sub-dep needs a C compiler on Windows, which would break
+# `pip install -r requirements.txt` for people who only want to run the exploit.
+#
+# Non-pip tools (see SETUP.md): adb (platform-tools), LLVM/clang, and for port.py also
+# payload-dumper-go + debugfs.
