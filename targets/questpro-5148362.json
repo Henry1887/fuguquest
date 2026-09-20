@@ -19,8 +19,7 @@
     "delta_selinux_from_anchor": "0x162ca18",
     "delta_findvpid_from_anchor": "0xff95d9ac",
     "delta_pidtask_from_anchor": "0xff95dc0c",
-    "delta_ssuse_from_anchor": "0xffd1ffec",
-    "delta_text_from_anchor": "0xff8f8a20"
+    "delta_ssuse_from_anchor": "0xffd1ffec"
   },
   "_comment_carrier": "MERGED: only not-loaded module on QPro with a big-enough init (680B) is rdbg. It is built by build_credmod (enforcing=0 + status-page sync + cred-patch of the waiting shell) and loaded once. llcc_perfmon is already loaded on QPro so cannot be a carrier.",
   "carrier": {

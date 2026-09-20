@@ -30,15 +30,17 @@ from the firmware + BTF. Run:
 python3 orchestrate.py -t targets/questpro-5148362.json --postex        # -> Permissive + uid 0 + Magisk
 ```
 
-> Static-only so far (no Quest Pro on hand): every offset is derived from `QPro_51483620027600340.zip`
-> + the device's BTF. On-device assumptions to confirm on first run: `module.sig_enforce` off (as on
-> Q3), the injection lib's SELinux label is shell-readable, and `dumpsys input` restarts
-> `trackingservice`. The Dirty-Frag primitive itself is already **confirmed working on 4.19**.
+> Status: on-device run #1 confirmed the chain executes end-to-end — rdbg loaded and our patched
+> `init_module` ran (panic log). It panicked because 4.19 routes the module's
+> `bl __platform_driver_register` through a **PLT veneer**, so decoding the bl gave the veneer, not
+> the symbol. Fixed: the anchor is now an **R_AARCH64_ABS64** slot the loader fills with the real
+> address (no CALL26/veneer). Remaining on-device unknowns: `module.sig_enforce` off (rdbg loaded, so
+> likely off), and Magisk setup. Dirty-Frag itself is **confirmed on 4.19**.
 
 ### Post-exploitation (`--postex`) — unprivileged → uid 0 root → Magisk
 After reaching Permissive, roots a shell and sets up Magisk, **no per-kernel compilation**:
 1. shell writes a **diff-patched cred carrier** (`usbip-vudc.ko`, not-loaded, 408 B init) to
-   `/data/local/tmp/uv.ko` — its init decodes the `__platform_driver_register` anchor and
+   `/data/local/tmp/uv.ko` — its init reads `&__platform_driver_register` from an ABS64 anchor and
    cred-patches a waiting shell's `task->cred` to uid 0 + all caps (anchor-relative `find_vpid`/
    `pid_task`/`selinux_state`, per-kernel deltas from the target JSON);
 2. shell poisons the cfg (permissive ⇒ DAC read) to `insmod|/data/local/tmp/uv.ko`;
@@ -93,7 +95,8 @@ the poison.
    kernel loads the unsigned module → `enforcing = 0`
 
 Key optimization: **diff-injection** — the target module is the *real* carrier with a 52-byte
-in-place init patch (relocation-free, decodes the module's own `bl` as a kernel-address anchor),
+in-place init patch (the enforcing carrier decodes its own `bl` anchor; the cred/merged carrier uses
+an ABS64 anchor the loader fills — veneer-proof — see `cred_patch.S.tmpl`),
 so only ~48 bytes need poisoning and the whole IV table fits libeva's existing gap (no 78 KB table).
 
 ## Files

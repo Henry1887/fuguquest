@@ -478,8 +478,6 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
                    k["delta_selinux_from_anchor"], k["delta_findvpid_from_anchor"],
                    k["delta_pidtask_from_anchor"], str(pid), k["delta_ssuse_from_anchor"],
                    str(k["enforcing_off"]), k.get("cred_off", "0x778")]
-        if k.get("delta_text_from_anchor"):
-            cm_args += [k["delta_text_from_anchor"]]   # pdr lower-bound guard (crash-proofs bad decode)
         r = subprocess.run(cm_args, capture_output=True, text=True)
         if r.returncode: err("build_credmod failed: " + r.stderr + r.stdout); wsh.stop(); stager.stop(); return
         ok(r.stdout.strip().split(": ", 1)[-1])
