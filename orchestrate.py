@@ -21,7 +21,12 @@
 #  targets/<name>/ and the JSON. No code changes.
 # ============================================================================================
 import argparse, json, os, re, struct, subprocess, sys, time, threading
-from Crypto.Cipher import AES
+try:
+    from Crypto.Cipher import AES
+except ModuleNotFoundError:
+    sys.exit(f"pycryptodome not found for THIS interpreter:\n  {sys.executable}\n"
+             f"Install it into this exact python (a bare `pip` may target a different one):\n"
+             f'  "{sys.executable}" -m pip install pycryptodome')
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
