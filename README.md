@@ -3,6 +3,9 @@
 Single orchestrator that runs the full zero-root chain: an unprivileged (`uid 2000` shell / any
 app) Dirty-Frag page-cache poison → unsigned kernel module load → `selinux_state.enforcing = 0`.
 
+> First time? See **[SETUP.md](SETUP.md)** for external-dependency install (Linux & Windows) and a
+> one-shot environment check. Tool paths live in `toolconf.py` (env-overridable).
+
 ```
 python3 orchestrate.py --target targets/<name>.json [--device SERIAL] [--settle N] [--verify-root]
                        [--no-restore | --leave-disabled | --postex | --adb-root]
@@ -114,6 +117,7 @@ so only ~48 bytes need poisoning and the whole IV table fits libeva's existing g
 ## Files
 - `orchestrate.py`   — the whole pipeline (build + stage + poison + trigger + verify + post-ex/cleanup);
   dispatches two-carrier (`run`) vs merged (`run_merged`) on `kernel.merged`
+- `SETUP.md`         — external-dependency install for Linux & Windows + environment self-check
 - `toolconf.py`      — ONE place for all external tool paths (clang/objcopy/readelf/nm, NDK,
   payload-dumper, debugfs, vmlinux-to-elf); env vars override. Imported by the scripts below.
 - `port.py`          — gather a new firmware's values → draft `targets/<name>.json` (+ binaries);
