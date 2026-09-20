@@ -63,6 +63,7 @@ skip:
     stp  x3, x3, [x2, #40]       // cap_inheritable, cap_permitted
     stp  x3, x3, [x2, #56]       // cap_effective, cap_bset
     str  x3, [x2, #72]           // cap_ambient
+@CTX@
 done:
     mov w0, wzr                  // return 0 (init success; module stays loaded, rmmod'd in postex)
     ldp x21, x22, [sp, #32]

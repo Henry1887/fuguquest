@@ -15,6 +15,7 @@
     "anchor_symbol": "__platform_driver_register",
     "enforcing_off": 1,
     "cred_off": "0x7e8",
+    "cred_security_off": "0x78",
     "merged": true,
     "delta_selinux_from_anchor": "0x162ca18",
     "delta_findvpid_from_anchor": "0xff95d9ac",

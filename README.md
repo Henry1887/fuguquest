@@ -5,8 +5,20 @@ app) Dirty-Frag page-cache poison → unsigned kernel module load → `selinux_s
 
 ```
 python3 orchestrate.py --target targets/<name>.json [--device SERIAL] [--settle N] [--verify-root]
-                       [--no-restore | --leave-disabled | --postex]
+                       [--no-restore | --leave-disabled | --postex | --adb-root]
 ```
+
+### `--adb-root` — root adb shells without Magisk
+Cred-patches the running **adbd** to `uid 0 + all caps + kernel SELinux context` and leaves SELinux
+**Permissive**, so every **new** `adb shell` is full root — no Magisk, no Zygisk. Use it to get a
+clean root shell (e.g. to isolate Magisk/Zygisk problems). Works on both device families (merged
+carrier on Quest Pro, usbip cred carrier on Quest 3); needs `kernel.cred_security_off` in the target.
+```
+python3 orchestrate.py -t targets/<name>.json --adb-root
+# then open a NEW shell:   adb shell   ->   id   # uid=0
+```
+Transient (RAM-only): a reboot fully clears it. Existing shells stay uid 2000; only shells forked
+after the patch are root.
 
 **One file, both devices.** The target JSON's `kernel.merged` flag picks the flow — no code changes:
 - **Quest 3** (5.10) — two-carrier flow. Validated on **5234532** (unit B, ~18 s) and **5243367**

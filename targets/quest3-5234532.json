@@ -18,7 +18,8 @@
     "enforcing_off": 0,
     "delta_findvpid_from_anchor": "0xff78a7f8",
     "delta_pidtask_from_anchor": "0xff5ab778",
-    "delta_ssuse_from_anchor": "0xffcc5048"
+    "delta_ssuse_from_anchor": "0xffcc5048",
+    "cred_security_off": "0x78"
   },
   "_comment_carrier": "A present-but-NOT-loaded vendor .ko (finit succeeds). init.text/rela offsets + the single CALL26 anchor are auto-derived from local_ko's ELF; anchor_reloc_off is where the patch template expects the anchor (fixed 0x14).",
   "carrier": {
