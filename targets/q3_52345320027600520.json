@@ -1,6 +1,6 @@
 {
-  "name": "quest3-5234532",
-  "description": "Quest 3 retail build 52345320027600520, kernel 5.10.240-gce8cca212ac5 (unit B)",
+  "name": "q3_52345320027600520",
+  "description": "Quest 3 build 52345320027600520, kernel 5.10.240-gce8cca212ac5",
   "device": {
     "build_incremental": "52345320027600520",
     "vermagic": "5.10.240-gce8cca212ac5"
@@ -24,7 +24,7 @@
   "_comment_carrier": "A present-but-NOT-loaded vendor .ko (finit succeeds). init.text/rela offsets + the single CALL26 anchor are auto-derived from local_ko's ELF; anchor_reloc_off is where the patch template expects the anchor (fixed 0x14).",
   "carrier": {
     "device_path": "/vendor/lib/modules/llcc_perfmon.ko",
-    "local_ko": "quest3-5234532/llcc_perfmon.ko",
+    "local_ko": "q3_52345320027600520/llcc_perfmon.ko",
     "anchor_reloc_off": "0x14"
   },
   "_comment_libeva": "SP-HAL lib mapped by trackingservice (hal_tracking_default), shell-readable. init_array[0] (RELR) redirected to the stub planted in stub_gap.",
@@ -44,7 +44,7 @@
   "_comment_cfg": "init.insmod.cfg (vendor_configs_file). inject_off must leave >=len(insmod line) bytes AND stay >17 bytes before EOF (sendfile tail limit). Keep modprobe intact.",
   "cfg": {
     "device_path": "/vendor/etc/init.insmod.cfg",
-    "local_cfg": "quest3-5234532/init.insmod.cfg",
+    "local_cfg": "q3_52345320027600520/init.insmod.cfg",
     "inject_off": "0x21",
     "inject_len": 54
   },
@@ -60,7 +60,7 @@
   },
   "cred_carrier": {
     "device_path": "/vendor/lib/modules/usbip-vudc.ko",
-    "local_ko": "quest3-5234532/usbip-vudc.ko",
+    "local_ko": "q3_52345320027600520/usbip-vudc.ko",
     "note": "not-loaded, dep usbip-core loaded; 408B init; anchor __platform_driver_register"
   }
 }

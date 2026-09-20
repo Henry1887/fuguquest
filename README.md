@@ -23,7 +23,7 @@ after the patch are root.
 **One file, both devices.** The target JSON's `kernel.merged` flag picks the flow — no code changes:
 - **Quest 3** (5.10) — two-carrier flow. Validated on **5234532** (unit B, ~18 s) and **5243367**
   (unit A, locked retail, ~20 s).
-- **Quest Pro** (4.19) — merged single-carrier flow (`targets/questpro-5148362.json`); see
+- **Quest Pro** (4.19) — merged single-carrier flow (`targets/QPro_51483620027600340.json`); see
   [Quest Pro](#quest-pro-merged-single-carrier) below.
 
 ### Quest Pro (merged single-carrier)
@@ -39,7 +39,7 @@ under Enforcing here, so shell poisons it directly. All values (deltas, offsets)
 from the firmware + BTF. Run:
 
 ```
-python3 orchestrate.py -t targets/questpro-5148362.json --postex        # -> Permissive + uid 0 + Magisk
+python3 orchestrate.py -t targets/QPro_51483620027600340.json --postex        # -> Permissive + uid 0 + Magisk
 ```
 
 > Status: on-device run #1 confirmed the chain executes end-to-end — rdbg loaded and our patched
@@ -121,8 +121,7 @@ so only ~48 bytes need poisoning and the whole IV table fits libeva's existing g
 - `build_credmod.py` — diff-patch the cred carrier (usbip-vudc on Q3, rdbg on QPro); takes
   `enf_off`/`cred_off` so one template covers 5.10 and 4.19
 - `PORTING.md`       — how to add a new firmware (automated + manual, both device families)
-- `targets/*.json`   — per-firmware constants/offsets/paths (quest3-5234532, quest3-5243367,
-  questpro-5148362)
+- `targets/*.json`   — per-firmware constants/offsets/paths (q3_<build>, QPro_<build> — named after the OTA zip)
 - `targets/<name>/`   — that firmware's gathered binaries: carrier `.ko` (llcc_perfmon on Q3, rdbg
   on QPro), `init.insmod.cfg` (+ `usbip-vudc.ko` on Q3)
 - `asm/` — `patch_init.S` (llcc enforcing patch, embedded in orchestrate.py), the injection ctor
@@ -136,8 +135,8 @@ so only ~48 bytes need poisoning and the whole IV table fits libeva's existing g
 One command (see `PORTING.md` for details + the manual equivalent):
 
 ```
-python3 port.py --zip q3_<build>.zip --name quest3-<short> --device <SERIAL>
-python3 orchestrate.py -t targets/quest3-<short>.json
+python3 port.py --zip q3_<build>.zip            # OTA-only; name defaults to the zip basename
+python3 orchestrate.py -t targets/q3_<build>.json
 ```
 
 `port.py` extracts the carrier/cfg/vmlinux from the exact-build zip, computes DELTA, and derives

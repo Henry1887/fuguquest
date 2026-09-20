@@ -6,24 +6,30 @@ version- and device-specific lives in that JSON; the `kernel.merged` flag select
 shape. The rest of this file describes the Quest 3 two-carrier flow (carrier `llcc_perfmon.ko` +
 cred carrier `usbip-vudc.ko` + `init.insmod.cfg`).
 
-You need the **exact-build firmware zip** `q3_<build>.zip` (for the carrier `.ko`, the cfg, and the
-kernel → DELTA) and the **device connected** (to read its own libeva / libandroid_servers, which are
-shell-readable, for exact offsets). Tools: `payload-dumper-go`, `debugfs`, `vmlinux-to-elf`,
+You need **only the exact-build firmware zip** `q3_<build>.zip` — everything (carrier `.ko`, cfg,
+kernel→DELTA, libeva/libgralloc + libandroid_servers offsets) is extracted from it. **No device is
+required.** A connected `--device` is optional and just skips the 1.2 GB `system` dump (it adb-pulls
+`libandroid_servers` instead). Tools: `payload-dumper-go`, `debugfs`, `vmlinux-to-elf`,
 `llvm-readelf`/`llvm-nm` (all tool paths live in `toolconf.py` — edit there or set env vars).
+
+The **target name defaults to the zip basename** (`QPro_<build>`, `q3_<build>`) — the naming scheme
+used in `targets/`. Override with `--name` if needed.
 
 ---
 
 ## Automated (recommended)
 
 ```
-python3 port.py --zip /path/q3_<build>.zip --name quest3-<short> --device <ADB_SERIAL>
+python3 port.py --zip /path/q3_<build>.zip                    # Quest 3 (OTA-only)
 ```
 
-This extracts boot/vendor/vendor_dlkm, pulls both carriers (`llcc_perfmon.ko` + `usbip-vudc.ko`) +
-cfg, runs vmlinux-to-elf to compute the four **anchor-relative deltas** (`selinux_state`,
-`find_vpid`, `pid_task`, `selinux_status_update_setenforce`, all minus `__platform_driver_register`),
-pulls libeva/libandroid from the device to derive their offsets (and scans libeva for the code gap),
-then writes `targets/quest3-<short>.json` + copies the binaries. It removes its 1.4 GB scratch on exit.
+This extracts boot/vendor/vendor_dlkm(/system when no device), pulls both carriers
+(`llcc_perfmon.ko` + `usbip-vudc.ko`) + cfg, runs vmlinux-to-elf to compute the four
+**anchor-relative deltas** (`selinux_state`, `find_vpid`, `pid_task`,
+`selinux_status_update_setenforce`, all minus `__platform_driver_register`), derives
+libeva/libandroid offsets (from `system.img`/vendor, or the device) and the libeva code gap,
+reads `build_incremental` from `system.img` build.prop (or the device), then writes
+`targets/<zip-basename>.json` + copies the binaries. It removes its multi-GB scratch on exit.
 
 **Verify the draft** before use:
 - `kernel.anchor_symbol` = `__platform_driver_register` (the CALL26 inside both carriers' init); the

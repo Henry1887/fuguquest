@@ -1,6 +1,6 @@
 {
-  "name": "questpro-5148362",
-  "description": "Quest Pro retail build 51483620027600340, kernel 4.19.325-cip128-st12-g48fa2afec075 (MERGED single-carrier chain)",
+  "name": "QPro_51483620027600340",
+  "description": "Quest Pro build 51483620027600340, kernel 4.19.325-cip128-st12-g48fa2afec075",
   "device": {
     "build_incremental": "51483620027600340",
     "vermagic": "4.19.325-cip128-st12-g48fa2afec075"
@@ -25,7 +25,7 @@
   "_comment_carrier": "MERGED: only not-loaded module on QPro with a big-enough init (680B) is rdbg. It is built by build_credmod (enforcing=0 + status-page sync + cred-patch of the waiting shell) and loaded once. llcc_perfmon is already loaded on QPro so cannot be a carrier.",
   "carrier": {
     "device_path": "/vendor/lib/modules/rdbg.ko",
-    "local_ko": "questpro-5148362/rdbg.ko",
+    "local_ko": "QPro_51483620027600340/rdbg.ko",
     "anchor_reloc_off": "0x14",
     "note": "merged cred carrier (680B .init.text, __platform_driver_register CALL26 anchor)"
   },
@@ -44,7 +44,7 @@
   },
   "cfg": {
     "device_path": "/vendor/etc/init.insmod.cfg",
-    "local_cfg": "questpro-5148362/init.insmod.cfg",
+    "local_cfg": "QPro_51483620027600340/init.insmod.cfg",
     "inject_off": "0x21",
     "inject_len": 54,
     "shell_poison_under_enforcing": true

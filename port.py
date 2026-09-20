@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # port.py — gather everything needed for a new firmware target and emit targets/<name>.json.
 #
-#   Quest 3 (two-carrier):  python3 port.py --zip q3_<build>.zip   --name quest3-<short> [--device S]
-#   Quest Pro (merged):     python3 port.py --zip QPro_<build>.zip --name questpro-<short> --merged \
-#                             --carrier rdbg --inject-lib libgralloc.qti.so --enforcing-off 1 \
-#                             --cred-off 0x7e8 [--device S]
+#   Quest 3 (two-carrier):  python3 port.py --zip q3_<build>.zip
+#   Quest Pro (merged):     python3 port.py --zip QPro_<build>.zip --merged --carrier rdbg \
+#                             --inject-lib libgralloc.qti.so --enforcing-off 1 --cred-off 0x7e8
+#
+# Fully OTA-only — no device needed (carrier/cfg/libs/kernel all come from the zip). --device just
+# speeds it up (skips the 1.2GB system dump by adb-pulling libandroid_servers instead). The target
+# name defaults to the zip's basename (QPro_<build> / q3_<build>).
 #
 # One emitter, both device families. --merged builds the single-carrier shape (rdbg diff-patched by
 # build_credmod into enforcing=0 + status-sync + cred-patch, cfg poisoned shell-direct). Non-merged
@@ -100,7 +103,8 @@ def dump_sym(lib, needle):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--zip", required=True); ap.add_argument("--name", required=True)
+    ap.add_argument("--zip", required=True)
+    ap.add_argument("--name", help="target name (default: the OTA zip's basename, e.g. QPro_<build>)")
     ap.add_argument("--device"); ap.add_argument("--anchor", default="__platform_driver_register")
     ap.add_argument("--merged", action="store_true",
                     help="single-carrier shape (Quest Pro): one module does enforcing=0+cred-patch")
@@ -115,16 +119,23 @@ def main():
                     help="selinux_state.enforcing byte offset (5.10=0, 4.19=1; confirm via BTF)")
     ap.add_argument("--cred-off", default="0x778",
                     help="task_struct->cred offset (5.10=0x778, 4.19=0x7e8; confirm via BTF)")
+    ap.add_argument("--cred-security-off", default="0x78",
+                    help="cred->security offset for --adb-root's kernel-context patch (0x78 on 5.10 & 4.19)")
     a = ap.parse_args()
     a.zip = os.path.abspath(a.zip)   # dump_partitions cd's into workdir; zip path must be absolute
+    # naming scheme: target name == the OTA zip basename (e.g. QPro_51483620027600340, q3_<build>)
+    a.name = a.name or os.path.splitext(os.path.basename(a.zip))[0]
     tdir = os.path.join(HERE, "targets", a.name); os.makedirs(tdir, exist_ok=True)
     scratch = os.path.join(HERE, "build"); os.makedirs(scratch, exist_ok=True)   # on disk, not tmpfs
     wd = tempfile.mkdtemp(prefix="port_", dir=scratch)
     atexit.register(lambda: shutil.rmtree(wd, ignore_errors=True))               # 1.4GB payload etc.
     print(f"[*] work dir {wd} (auto-removed on exit)   merged={a.merged}")
 
-    print("[*] dumping boot, vendor, vendor_dlkm, system ...")
-    dump_partitions(a.zip, wd, ["boot", "vendor", "vendor_dlkm", "system"])
+    # system (1.2GB) is only needed to pull libandroid_servers from the OTA; skip it if a device is
+    # connected (we adb-pull that lib instead). vendor_dlkm is absent on QPro — payload-dumper skips it.
+    parts = ["boot", "vendor", "vendor_dlkm"] + ([] if a.device else ["system"])
+    print("[*] dumping " + ", ".join(parts) + " ...")
+    dump_partitions(a.zip, wd, parts)
     IMGS = ["vendor.img", "vendor_dlkm.img"]           # QPro: vendor; Q3: vendor_dlkm — try both
 
     print(f"[*] extracting carrier ({a.carrier}) + cfg ...")
@@ -171,18 +182,35 @@ def main():
     print(f"[*] inject-lib ({a.inject_lib}) / libandroid offsets ...")
     ilib = lib_from_device_or_zip(a.inject_lib, f"/vendor/lib64/{a.inject_lib}", a.device, wd,
                                   [os.path.join(wd, i) for i in IMGS], [f"/lib64/{a.inject_lib}"] * 2)
+    # system.img is system-as-root (rooted at /) so the path inside it is /system/lib64/... ; a device
+    # pull uses the same absolute path. Try both rootings so it works regardless of image layout.
     libas = lib_from_device_or_zip("libandroid_servers.so", "/system/lib64/libandroid_servers.so",
-                                   a.device, wd, [os.path.join(wd, "system.img")], ["/lib64/libandroid_servers.so"])
-    if not ilib: die(f"could not obtain {a.inject_lib} (connect --device, or it's not in vendor)")
-    if not libas: die("could not obtain libandroid_servers (connect --device — it lives in system, not dumped here)")
+                                   a.device, wd, [os.path.join(wd, "system.img")] * 2,
+                                   ["/system/lib64/libandroid_servers.so", "/lib64/libandroid_servers.so"])
+    if not ilib: die(f"could not obtain {a.inject_lib} (not in vendor.img — check --inject-lib name)")
+    if not libas: die("could not obtain libandroid_servers from system.img (was 'system' dumped?)")
     ia_off, ctor = init_array_and_ctor(ilib)
     gap_off, gap_sz = find_gap(ilib)
     dump_off, dump_sz = dump_sym(libas, "NativeInputManager4dumpE")
 
-    build = subprocess.run(["adb", "-s", a.device, "shell", "getprop", "ro.build.version.incremental"],
-                           capture_output=True, text=True).stdout.strip() if a.device else "UNKNOWN-set-me"
+    # build_incremental: from the device if connected, else from the OTA (system.img build.prop),
+    # else the digits in the zip filename. Keeps porting fully OTA-only (no device required).
+    build = ""
+    if a.device:
+        build = subprocess.run(["adb", "-s", a.device, "shell", "getprop", "ro.build.version.incremental"],
+                               capture_output=True, text=True).stdout.strip()
+    if not build:
+        bp = os.path.join(wd, "build.prop")
+        for inner in ("/system/build.prop", "/build.prop"):
+            if debugfs_dump(os.path.join(wd, "system.img"), inner, bp): break
+        if os.path.exists(bp):
+            m = re.search(r"ro\.build\.version\.incremental=(\S+)", open(bp, errors="replace").read())
+            if m: build = m.group(1)
+    if not build:
+        m = re.search(r"(\d{6,})", os.path.basename(a.zip))   # e.g. QPro_51483620027600340.zip
+        build = m.group(1) if m else "UNKNOWN-set-me"
     kernel = {"anchor_symbol": anchor, "enforcing_off": a.enforcing_off,
-              "cred_off": a.cred_off, "merged": a.merged,
+              "cred_off": a.cred_off, "cred_security_off": a.cred_security_off, "merged": a.merged,
               "delta_selinux_from_anchor": d32("selinux_state"),
               "delta_findvpid_from_anchor": d32("find_vpid"),
               "delta_pidtask_from_anchor": d32("pid_task"),
