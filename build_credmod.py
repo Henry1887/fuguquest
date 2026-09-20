@@ -6,8 +6,8 @@
 # both devices — the caller (orchestrate.py) reads them from the target JSON.
 import struct, subprocess, sys, os
 HERE = os.path.dirname(os.path.abspath(__file__))
-TC = os.environ.get("AOSP_CLANG_BIN", "/home/henry/Tools/aosp-clang/clang-r450784e/bin")
-CLANG, OBJCOPY, READELF = (os.path.join(TC, x) for x in ("clang", "llvm-objcopy", "llvm-readelf"))
+sys.path.insert(0, HERE)
+from toolconf import CLANG, OBJCOPY, READELF   # central tool locations (edit toolconf.py / set env)
 R_AARCH64_CALL26 = 0x11b
 
 def _int(x): return int(x, 16) if isinstance(x, str) and x.lower().startswith("0x") else int(x)

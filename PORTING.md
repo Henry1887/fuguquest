@@ -9,7 +9,7 @@ cred carrier `usbip-vudc.ko` + `init.insmod.cfg`).
 You need the **exact-build firmware zip** `q3_<build>.zip` (for the carrier `.ko`, the cfg, and the
 kernel → DELTA) and the **device connected** (to read its own libeva / libandroid_servers, which are
 shell-readable, for exact offsets). Tools: `payload-dumper-go`, `debugfs`, `vmlinux-to-elf`,
-`llvm-readelf`/`llvm-nm` (paths are set at the top of `port.py`).
+`llvm-readelf`/`llvm-nm` (all tool paths live in `toolconf.py` — edit there or set env vars).
 
 ---
 

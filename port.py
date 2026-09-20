@@ -14,9 +14,8 @@
 # Needs: payload-dumper-go, debugfs, vmlinux-to-elf, llvm-readelf/nm.
 import argparse, json, os, re, struct, subprocess, sys, tempfile, shutil, atexit
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOOLS = "/home/henry/Tools/aosp-clang/clang-r450784e/bin"
-READELF, NM = os.path.join(TOOLS, "llvm-readelf"), os.path.join(TOOLS, "llvm-nm")
-PDG = os.environ.get("PAYLOAD_DUMPER", "/home/henry/Tools/payload-dumper-go_1.3.0_linux_amd64/payload-dumper-go")
+sys.path.insert(0, HERE)
+from toolconf import READELF, NM, PDG, DEBUGFS, VMLINUX_TO_ELF   # central tool locations (edit toolconf.py / set env)
 R_AARCH64_CALL26 = 0x11b
 
 def sh(c): return subprocess.run(c, shell=True, capture_output=True, text=True).stdout
@@ -28,7 +27,7 @@ def dump_partitions(zippath, workdir, parts):
                     os.path.join(workdir, "payload.bin")], capture_output=True)
 
 def debugfs_dump(img, inner, outp):
-    subprocess.run(["debugfs", "-R", f"dump {inner} {outp}", img], capture_output=True)
+    subprocess.run([DEBUGFS, "-R", f"dump {inner} {outp}", img], capture_output=True)
     return os.path.exists(outp) and os.path.getsize(outp) > 0
 
 def carrier_anchor_symbol(ko):
@@ -155,7 +154,7 @@ def main():
 
     print("[*] vmlinux-to-elf (deltas: selinux_state, find_vpid, pid_task, ssuse) ...")
     vm = os.path.join(wd, "vmlinux.elf")
-    subprocess.run(["vmlinux-to-elf", os.path.join(wd, "boot.img"), vm], capture_output=True)
+    subprocess.run([VMLINUX_TO_ELF, os.path.join(wd, "boot.img"), vm], capture_output=True)
     want = ("selinux_state", anchor, "find_vpid", "pid_task", "selinux_status_update_setenforce",
             "_text", "_etext")
     syms = {}

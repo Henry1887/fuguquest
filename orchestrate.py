@@ -24,8 +24,8 @@ import argparse, json, os, re, struct, subprocess, sys, time, threading
 from Crypto.Cipher import AES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOOLS = os.environ.get("AOSP_CLANG_BIN", "/home/henry/Tools/aosp-clang/clang-r450784e/bin")
-CLANG, OBJCOPY, READELF = (os.path.join(TOOLS, x) for x in ("clang", "llvm-objcopy", "llvm-readelf"))
+sys.path.insert(0, HERE)
+from toolconf import CLANG, OBJCOPY, READELF   # central tool locations (edit toolconf.py / set env)
 DEX = os.path.join(HERE, "e2e.dex")
 BUILD = os.path.join(HERE, "build")
 

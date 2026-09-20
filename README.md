@@ -99,6 +99,8 @@ so only ~48 bytes need poisoning and the whole IV table fits libeva's existing g
 ## Files
 - `orchestrate.py`   — the whole pipeline (build + stage + poison + trigger + verify + post-ex/cleanup);
   dispatches two-carrier (`run`) vs merged (`run_merged`) on `kernel.merged`
+- `toolconf.py`      — ONE place for all external tool paths (clang/objcopy/readelf/nm, NDK,
+  payload-dumper, debugfs, vmlinux-to-elf); env vars override. Imported by the scripts below.
 - `port.py`          — gather a new firmware's values → draft `targets/<name>.json` (+ binaries);
   `--merged` emits the single-carrier shape (Quest Pro)
 - `build_credmod.py` — diff-patch the cred carrier (usbip-vudc on Q3, rdbg on QPro); takes
