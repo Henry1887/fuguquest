@@ -14,6 +14,14 @@ import struct, subprocess, sys, os, tempfile, shutil, atexit
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from toolconf import CLANG, OBJCOPY, READELF   # central tool locations (edit toolconf.py / set env)
+
+def _need(tool, label):
+    if os.path.isfile(tool) or shutil.which(tool): return
+    sys.exit(f"{label} not found: {tool}\n"
+             f"Install LLVM/clang and set AOSP_CLANG_BIN (or put it on PATH). See SETUP.md.\n"
+             f"  Windows:  winget install LLVM.LLVM   then  set AOSP_CLANG_BIN=C:\\Program Files\\LLVM\\bin\n"
+             f"  Linux:    dnf/apt install clang llvm  (AOSP_CLANG_BIN=/usr/bin)")
+_need(CLANG, "clang"); _need(OBJCOPY, "llvm-objcopy")
 R_AARCH64_CALL26 = 0x11b
 R_AARCH64_ABS64  = 0x101
 
