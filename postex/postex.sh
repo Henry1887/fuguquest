@@ -1,15 +1,18 @@
 #!/system/bin/sh
-# Runs as the cred-patched (uid 0, all caps) waiting shell. The usbip carrier already flipped
+# Runs as the cred-patched (uid 0, all caps) waiting shell. The carrier module already flipped
 # enforcing=0 AND synced the SELinux status page (selinux_status_update_setenforce) so userspace
 # is truly permissive -> setprop/ctl.*/magiskpolicy work.
 #   drop_caches -> rmmod carriers -> Singularity Magisk (v30.7 fork, NO zygote restart) -> setenforce 1
+# CARRIER_MODS (space-separated, from the orchestrator) = the modules to unload for this target
+# (Q3: "usbip_vudc llcc_perfmon"; Quest Pro: "rdbg").
 LOG=/data/local/tmp/postex.log
 {
 echo "=== postex start: uid=$(id -u) ctx=$(id -Z 2>/dev/null) enforce=$(getenforce) ==="
 cd /data/local/tmp
 sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && echo "[+] drop_caches"
-rmmod usbip_vudc 2>/dev/null   && echo "[+] rmmod usbip_vudc"
-rmmod llcc_perfmon 2>/dev/null && echo "[+] rmmod llcc_perfmon"
+for m in ${CARRIER_MODS:-usbip_vudc llcc_perfmon}; do
+  rmmod $m 2>/dev/null && echo "[+] rmmod $m"
+done
 if [ "$SKIP_MAGISK" = "1" ]; then
   echo "[i] SKIP_MAGISK=1 (magisk step skipped)"
 else

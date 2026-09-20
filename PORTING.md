@@ -1,8 +1,10 @@
-# Porting DirtyFrag-LPE to a new Quest 3 firmware
+# Porting DirtyFrag-LPE to a new firmware (Quest 3 or Quest Pro)
 
-A target is one `targets/<name>.json` + two gathered binaries in `targets/<name>/`
-(the carrier `llcc_perfmon.ko` and the original `init.insmod.cfg`). Everything version-specific
-lives in that JSON; no code changes.
+A target is one `targets/<name>.json` + the gathered binaries in `targets/<name>/`. Everything
+version- and device-specific lives in that JSON; the `kernel.merged` flag selects the flow, so the
+**same orchestrator runs Quest 3 and Quest Pro**. See the Quest Pro section below for the merged
+shape. The rest of this file describes the Quest 3 two-carrier flow (carrier `llcc_perfmon.ko` +
+cred carrier `usbip-vudc.ko` + `init.insmod.cfg`).
 
 You need the **exact-build firmware zip** `q3_<build>.zip` (for the carrier `.ko`, the cfg, and the
 kernel → DELTA) and the **device connected** (to read its own libeva / libandroid_servers, which are
@@ -74,3 +76,40 @@ finit trigger: `adb shell setprop ctl.start insmod_sh` (should be allowed for `s
 > Note: across the builds seen so far the **userspace libs are identical** (only the kernel
 > changes), so `libeva`/`libandroid`/`cfg`/carrier-layout values carried over unchanged between
 > 5234532 and 5243367 — only `vermagic` and `delta_selinux_from_anchor` differed. Still verify.
+
+---
+
+## Quest Pro (merged single-carrier)
+
+Quest Pro's 4.19 kernel needs a different shape, all target-driven (`kernel.merged: true`):
+
+- **struct offsets differ** — `selinux_state.enforcing @ +1` (byte 0 is `disabled`), `task_struct.cred
+  @ 0x7e8`. Confirm both from the device's BTF:
+  `adb shell su -c 'cat /sys/kernel/btf/vmlinux' > btf.bin && pahole -C selinux_state btf.bin` and
+  `pahole -C task_struct btf.bin | grep -w cred`. Set `kernel.enforcing_off` / `kernel.cred_off`.
+- **one merged carrier** — the only not-loaded module with a big-enough init is `rdbg` (680 B);
+  `llcc_perfmon` is already loaded and the USB-net modules are too small for the 196 B cred-patch. So
+  `build_credmod` diff-patches `rdbg` into enforcing=0 + status-sync + cred-patch and it loads once.
+  `rdbg`'s init CALL26 anchor is `__platform_driver_register` (same as Q3).
+- **1-file ctor injection** — `rdbg` is `vendor_file` (shell can't read it under Enforcing), so it's
+  poisoned by an `init_array` ctor injected into `libgralloc.qti.so` (a `same_process_hal_file` lib
+  mapped by `trackingservice`, RELR init_array, ~3.7 KB exec gap). The cfg **is** shell-readable under
+  Enforcing on QPro, so shell poisons it directly (no 2nd table in the ctor — the 243-entry carrier
+  table alone nearly fills the gap).
+
+```
+python3 port.py --zip QPro_<build>.zip --name questpro-<short> --merged \
+  --carrier rdbg --inject-lib libgralloc.qti.so --enforcing-off 1 --cred-off 0x7e8 --device <SERIAL>
+python3 orchestrate.py -t targets/questpro-<short>.json --postex
+```
+
+`port.py --merged` extracts `rdbg` + cfg (QPro keeps modules in `vendor.img:/lib/modules`), computes
+the four anchor-relative deltas, derives `libgralloc.qti` init_array/ctor/gap and the
+`libandroid_servers::dump` offset, and emits the merged JSON (no `cred_carrier`, adds
+`cfg.shell_poison_under_enforcing`). `libandroid_servers` lives in `system` — pass `--device` so it's
+pulled via adb (QPro's `system` isn't a standalone payload partition).
+
+**Verify on first run** (static-derived, not yet run on hardware): `module.sig_enforce` off,
+`libgralloc.qti.so` shell-readable, `dumpsys input` restarts `trackingservice`, and the injection
+stub still fits the lib's gap (`build_inject_stub` errors if not — pick a lib with a bigger gap, e.g.
+`libcdsprpc.so`, listed in the target as `inject_lib`).

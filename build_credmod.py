@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-# build_credmod.py <carrier.ko> <out.ko> <dsel_hex> <dfv_hex> <dpt_hex> <pid>
-# Diff-patch a NOT-loaded carrier's init_module into an enforcing=0 + cred-patch payload.
+# build_credmod.py <carrier.ko> <out.ko> <dsel> <dfv> <dpt> <pid> <dssuse> [enf_off] [cred_off]
+# Diff-patch a NOT-loaded carrier's init_module into an enforcing=0 + status-sync + cred-patch payload.
 # deltas are (symbol - __platform_driver_register) from the target vmlinux (signed, 32-bit range).
+# enf_off/cred_off default to Q3 5.10 (0 / 0x778); pass 1 / 0x7e8 for Quest Pro 4.19. One template,
+# both devices — the caller (orchestrate.py) reads them from the target JSON.
 import struct, subprocess, sys, os
 HERE = os.path.dirname(os.path.abspath(__file__))
 TC = os.environ.get("AOSP_CLANG_BIN", "/home/henry/Tools/aosp-clang/clang-r450784e/bin")
 CLANG, OBJCOPY, READELF = (os.path.join(TC, x) for x in ("clang", "llvm-objcopy", "llvm-readelf"))
 R_AARCH64_CALL26 = 0x11b
 
-# <carrier> <out> <dsel> <dfv> <dpt> <pid> <dssuse>
-carrier, out = sys.argv[1], sys.argv[2]
-dsel, dfv, dpt, pid, dssuse = (int(x, 16) if isinstance(x, str) and x.startswith("0x") else int(x)
-                       for x in (sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7]))
+def _int(x): return int(x, 16) if isinstance(x, str) and x.lower().startswith("0x") else int(x)
 
-# --- assemble the template ---
-s = os.path.join(HERE, "asm", "cred_patch.S")
-o = "/tmp/cred_patch.o"; b = "/tmp/cred_patch.bin"
+# <carrier> <out> <dsel> <dfv> <dpt> <pid> <dssuse> [enf_off] [cred_off]
+carrier, out = sys.argv[1], sys.argv[2]
+dsel, dfv, dpt, pid, dssuse = (_int(x) for x in sys.argv[3:8])
+enf_off  = _int(sys.argv[8]) if len(sys.argv) > 8 else 0        # selinux_state.enforcing byte offset
+cred_off = _int(sys.argv[9]) if len(sys.argv) > 9 else 0x778    # task_struct->cred
+
+# --- assemble the template (substitute per-target struct offsets) ---
+tmpl = open(os.path.join(HERE, "asm", "cred_patch.S.tmpl")).read()
+src = tmpl.replace("@ENF_OFF@", str(enf_off)).replace("@CRED_OFF@", hex(cred_off))
+s = "/tmp/cred_patch.S"; o = "/tmp/cred_patch.o"; b = "/tmp/cred_patch.bin"
+open(s, "w").write(src)
 subprocess.run([CLANG, "-target", "aarch64-linux-gnu", "-c", s, "-o", o], check=True, capture_output=True)
 subprocess.run([OBJCOPY, "-O", "binary", "--only-section=.patch", o, b], check=True)
 patch = bytearray(open(b, "rb").read())

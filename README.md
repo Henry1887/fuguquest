@@ -1,14 +1,39 @@
-# DirtyFrag-LPE — unprivileged Quest 3 SELinux Enforcing→Permissive
+# DirtyFrag-LPE — unprivileged SELinux Enforcing→Permissive + root (Quest 3 & Quest Pro)
 
 Single orchestrator that runs the full zero-root chain: an unprivileged (`uid 2000` shell / any
 app) Dirty-Frag page-cache poison → unsigned kernel module load → `selinux_state.enforcing = 0`.
 
 ```
 python3 orchestrate.py --target targets/<name>.json [--device SERIAL] [--settle N] [--verify-root]
-                       [--no-restore | --leave-disabled]
+                       [--no-restore | --leave-disabled | --postex]
 ```
 
-Validated on two builds: **5234532** (unit B, ~18 s) and **5243367** (unit A, locked retail, ~20 s).
+**One file, both devices.** The target JSON's `kernel.merged` flag picks the flow — no code changes:
+- **Quest 3** (5.10) — two-carrier flow. Validated on **5234532** (unit B, ~18 s) and **5243367**
+  (unit A, locked retail, ~20 s).
+- **Quest Pro** (4.19) — merged single-carrier flow (`targets/questpro-5148362.json`); see
+  [Quest Pro](#quest-pro-merged-single-carrier) below.
+
+### Quest Pro (merged single-carrier)
+Quest Pro's 4.19 kernel differs (`selinux_state.enforcing @ +1`, `task_struct.cred @ 0x7e8`) and,
+critically, its **only** not-loaded module with a big-enough init is `rdbg` (680 B) — `llcc_perfmon`
+is already loaded, and the small USB-net modules (≤168 B init) can't hold the 196 B cred-patch. So a
+single carrier does everything: `build_credmod` diff-patches `rdbg` into
+`enforcing=0 + status-page-sync + cred-patch(waiting-shell pid)`, and it is loaded **once** →
+Permissive **and** root together. Because `rdbg` is `vendor_file` (shell can't read it under
+Enforcing) it's poisoned by a **1-file** `init_array` ctor injected into `libgralloc.qti.so` (a
+`same_process_hal_file` lib mapped by `trackingservice`, 3.7 KB code gap); the cfg *is* shell-readable
+under Enforcing here, so shell poisons it directly. All values (deltas, offsets) verified statically
+from the firmware + BTF. Run:
+
+```
+python3 orchestrate.py -t targets/questpro-5148362.json --postex        # -> Permissive + uid 0 + Magisk
+```
+
+> Static-only so far (no Quest Pro on hand): every offset is derived from `QPro_51483620027600340.zip`
+> + the device's BTF. On-device assumptions to confirm on first run: `module.sig_enforce` off (as on
+> Q3), the injection lib's SELinux label is shell-readable, and `dumpsys input` restarts
+> `trackingservice`. The Dirty-Frag primitive itself is already **confirmed working on 4.19**.
 
 ### Post-exploitation (`--postex`) — unprivileged → uid 0 root → Magisk
 After reaching Permissive, roots a shell and sets up Magisk, **no per-kernel compilation**:
@@ -72,16 +97,21 @@ in-place init patch (relocation-free, decodes the module's own `bl` as a kernel-
 so only ~48 bytes need poisoning and the whole IV table fits libeva's existing gap (no 78 KB table).
 
 ## Files
-- `orchestrate.py`   — the whole pipeline (build + stage + poison + trigger + verify + post-ex/cleanup)
-- `port.py`          — gather a new firmware's values → draft `targets/<name>.json` (+ binaries)
-- `build_credmod.py` — diff-patch the usbip-vudc cred carrier (called by `--postex`)
-- `PORTING.md`       — how to add a new firmware (automated + manual)
-- `targets/*.json`   — per-firmware constants/offsets/paths (5234532, 5243367)
-- `targets/<name>/`   — that firmware's gathered binaries: `llcc_perfmon.ko` (enforcing carrier),
-  `usbip-vudc.ko` (cred carrier), `init.insmod.cfg`
-- `asm/` — `patch_init.S` (llcc enforcing patch, embedded in orchestrate.py), `eva_kopoison.S.tmpl`
-  (libeva ctor 2-file poison stub), `libas_restart.S.tmpl` (system_server restart stub),
-  `cred_patch.S` (usbip cred-patch + status-page sync)
+- `orchestrate.py`   — the whole pipeline (build + stage + poison + trigger + verify + post-ex/cleanup);
+  dispatches two-carrier (`run`) vs merged (`run_merged`) on `kernel.merged`
+- `port.py`          — gather a new firmware's values → draft `targets/<name>.json` (+ binaries);
+  `--merged` emits the single-carrier shape (Quest Pro)
+- `build_credmod.py` — diff-patch the cred carrier (usbip-vudc on Q3, rdbg on QPro); takes
+  `enf_off`/`cred_off` so one template covers 5.10 and 4.19
+- `PORTING.md`       — how to add a new firmware (automated + manual, both device families)
+- `targets/*.json`   — per-firmware constants/offsets/paths (quest3-5234532, quest3-5243367,
+  questpro-5148362)
+- `targets/<name>/`   — that firmware's gathered binaries: carrier `.ko` (llcc_perfmon on Q3, rdbg
+  on QPro), `init.insmod.cfg` (+ `usbip-vudc.ko` on Q3)
+- `asm/` — `patch_init.S` (llcc enforcing patch, embedded in orchestrate.py), the injection ctor
+  stub (generated in-code by `build_inject_stub`, N-file / dynamic tables), `libas_restart.S.tmpl`
+  (system_server restart stub), `cred_patch.S.tmpl` (cred-patch + status-page sync; `@ENF_OFF@`/
+  `@CRED_OFF@` substituted per target)
 - `java/Stager.java`, `java/Writer.java` → `e2e.dex` — firmware-independent Dirty-Frag primitives
 - `postex/postex.sh` + `postex/assets/{singularity_magisk.sh, singularity-Magisk.apk}` — the root payload
 
