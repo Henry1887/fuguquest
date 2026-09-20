@@ -3,6 +3,10 @@
 The scripts are pure Python and OS-independent, but they shell out to a few external tools. Install
 the ones for what you'll run, then point `toolconf.py` (or env vars) at them.
 
+> Always install with **`python -m pip …`** (not bare `pip`) so packages land in the *same*
+> interpreter that runs `python orchestrate.py` — a `pip`/`python` mismatch is the usual cause of
+> `ModuleNotFoundError: No module named 'Crypto'` even though pip says it's already satisfied.
+
 | Tool | Needed by | `toolconf.py` / env var | Notes |
 |------|-----------|-------------------------|-------|
 | **Python 3.8+** | everything | — | run scripts with `python` / `python3` |
@@ -23,7 +27,8 @@ the ones for what you'll run, then point `toolconf.py` (or env vars) at them.
 
 ```bash
 # Python libs
-python3 -m pip install --user -r requirements.txt   # pycryptodome (+ vmlinux-to-elf for port.py)
+python3 -m pip install --user -r requirements.txt              # RUN the exploit (pycryptodome)
+python3 -m pip install --user -r requirements-port.txt         # only to ADD targets (vmlinux-to-elf)
 
 # distro packages
 #  Fedora:
@@ -54,7 +59,9 @@ Install (PowerShell; `winget` or manual downloads):
 ```powershell
 winget install Python.Python.3.12
 winget install LLVM.LLVM                        # -> C:\Program Files\LLVM\bin (clang.exe, llvm-*.exe)
-python -m pip install -r requirements.txt   # pycryptodome (+ vmlinux-to-elf for port.py)
+python -m pip install -r requirements.txt          # RUN the exploit (pycryptodome only)
+# python -m pip install -r requirements-port.txt   # ONLY to add targets; its minilzo dep needs MSVC
+#                                                  #   build tools on Windows -> prefer porting under WSL
 ```
 - **adb**: download *SDK Platform-Tools for Windows* from
   https://developer.android.com/tools/releases/platform-tools , unzip (e.g. `C:\platform-tools`),
