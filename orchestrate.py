@@ -69,7 +69,8 @@ except ModuleNotFoundError:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from toolconf import CLANG, OBJCOPY, READELF   # central tool locations (edit toolconf.py / set env)
+from toolconf import CLANG                     # only clang is needed to build (see elfutil)
+from elfutil import obj_section_and_syms        # pure-Python ELF read -> no llvm-objcopy/readelf needed
 DEX = os.path.join(HERE, "e2e.dex")
 BUILD = os.path.join(HERE, "build")
 
@@ -201,18 +202,11 @@ def build_cfg(tgt, tdir, insmod_path=None):
     return orig, bytes(patched)
 
 def assemble(src_text, name):
-    s = os.path.join(BUILD, name + ".S"); o = os.path.join(BUILD, name + ".o"); b = os.path.join(BUILD, name + ".bin")
+    s = os.path.join(BUILD, name + ".S"); o = os.path.join(BUILD, name + ".o")
     open(s, "w").write(src_text)
     subprocess.run([CLANG, "-target", "aarch64-linux-gnu", "-c", s, "-o", o], check=True,
                    capture_output=True)
-    subprocess.run([OBJCOPY, "-O", "binary", "--only-section=.stub", o, b], check=True)
-    raw = open(b, "rb").read()
-    syms = {}
-    for l in subprocess.run([READELF, "-s", o], capture_output=True, text=True).stdout.splitlines():
-        f = l.split()
-        if len(f) >= 8 and re.fullmatch(r"[0-9a-fA-F]{16}", f[1]) and f[6].isdigit():
-            syms[f[7]] = int(f[1], 16)   # defined local labels (section-relative offset)
-    return bytearray(raw), syms
+    return obj_section_and_syms(o, ".stub")   # pure-Python: .stub bytes + {label: offset} (no objcopy/readelf)
 
 def inj(tgt):
     # generic injection lib (Q3 targets say "libeva"; QPro says "inject_lib"). Same sub-fields.
@@ -670,13 +664,12 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
 
 def require_toolchain():
     import shutil
-    for tool, label in ((CLANG, "clang"), (OBJCOPY, "llvm-objcopy"), (READELF, "llvm-readelf")):
-        if not (os.path.isfile(tool) or shutil.which(tool)):
-            err(f"{label} not found: {tool}")
-            warn("Install LLVM/clang and set AOSP_CLANG_BIN (or put it on PATH) — see SETUP.md:")
-            warn("  Windows:  winget install LLVM.LLVM   then  set AOSP_CLANG_BIN=C:\\Program Files\\LLVM\\bin")
-            warn("  Linux:    dnf/apt install clang llvm  (AOSP_CLANG_BIN=/usr/bin)")
-            sys.exit(1)
+    if os.path.isfile(CLANG) or shutil.which(CLANG): return   # only clang is needed to build
+    err(f"clang not found: {CLANG}")
+    warn("Install LLVM/clang and set AOSP_CLANG_BIN (or put it on PATH) — see SETUP.md:")
+    warn("  Windows:  winget install LLVM.LLVM   then  set AOSP_CLANG_BIN=C:\\Program Files\\LLVM\\bin")
+    warn("  Linux:    dnf/apt install clang llvm  (AOSP_CLANG_BIN=/usr/bin)")
+    sys.exit(1)
 
 def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=False):
     tgt = json.load(open(target_path))

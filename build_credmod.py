@@ -13,15 +13,14 @@
 import struct, subprocess, sys, os, tempfile, shutil, atexit
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from toolconf import CLANG, OBJCOPY, READELF   # central tool locations (edit toolconf.py / set env)
+from toolconf import CLANG                    # only clang is needed to build
+from elfutil import obj_section_and_syms      # pure-Python ELF read -> no llvm-objcopy/readelf needed
 
-def _need(tool, label):
-    if os.path.isfile(tool) or shutil.which(tool): return
-    sys.exit(f"{label} not found: {tool}\n"
+if not (os.path.isfile(CLANG) or shutil.which(CLANG)):
+    sys.exit(f"clang not found: {CLANG}\n"
              f"Install LLVM/clang and set AOSP_CLANG_BIN (or put it on PATH). See SETUP.md.\n"
              f"  Windows:  winget install LLVM.LLVM   then  set AOSP_CLANG_BIN=C:\\Program Files\\LLVM\\bin\n"
              f"  Linux:    dnf/apt install clang llvm  (AOSP_CLANG_BIN=/usr/bin)")
-_need(CLANG, "clang"); _need(OBJCOPY, "llvm-objcopy")
 R_AARCH64_CALL26 = 0x11b
 R_AARCH64_ABS64  = 0x101
 
@@ -51,15 +50,11 @@ tmpl = open(os.path.join(HERE, "asm", "cred_patch.S.tmpl")).read()
 src = tmpl.replace("@ENF_OFF@", str(enf_off)).replace("@CRED_OFF@", hex(cred_off)).replace("@CTX@", CTX)
 _td = tempfile.mkdtemp(prefix="credmod_")           # cross-OS temp (%TEMP% on Windows, /tmp on Linux)
 atexit.register(lambda: shutil.rmtree(_td, ignore_errors=True))
-s = os.path.join(_td, "cred_patch.S"); o = os.path.join(_td, "cred_patch.o"); b = os.path.join(_td, "cred_patch.bin")
+s = os.path.join(_td, "cred_patch.S"); o = os.path.join(_td, "cred_patch.o")
 open(s, "w").write(src)
 subprocess.run([CLANG, "-target", "aarch64-linux-gnu", "-c", s, "-o", o], check=True, capture_output=True)
-subprocess.run([OBJCOPY, "-O", "binary", "--only-section=.patch", o, b], check=True)
-patch = bytearray(open(b, "rb").read())
-anchor_off = None
-for l in subprocess.run([READELF, "-s", o], capture_output=True, text=True).stdout.splitlines():
-    f = l.split()
-    if len(f) >= 8 and f[7] == "anchor64": anchor_off = int(f[1], 16)
+patch, syms = obj_section_and_syms(o, ".patch")   # pure-Python: .patch bytes + labels (no objcopy/readelf)
+anchor_off = syms.get("anchor64")
 assert anchor_off is not None, "anchor64 label not found"
 assert anchor_off % 8 == 0, f"anchor64 not 8-aligned (0x{anchor_off:x})"
 

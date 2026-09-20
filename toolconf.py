@@ -16,7 +16,6 @@ CLANG_BIN = os.environ.get("AOSP_CLANG_BIN", "/home/henry/Tools/aosp-clang/clang
 # Android NDK llvm prebuilt bin (aarch64-linux-android*-clang): native PoCs / rebuilding e2e.dex tools.
 NDK_BIN   = os.environ.get("NDK_BIN",
     "/home/henry/Tools/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin")
-
 # --- resolver: prefer the configured bin dir, else fall back to the tool on PATH ------------------
 # So it "just works" if clang/llvm are installed and on PATH (e.g. `winget install LLVM.LLVM`) even
 # when AOSP_CLANG_BIN still points at the default. `.exe` is added on Windows. If nothing is found,
