@@ -96,6 +96,7 @@ def main():
     ap.add_argument("--zip", required=True); ap.add_argument("--name", required=True)
     ap.add_argument("--device"); ap.add_argument("--anchor", default="__platform_driver_register")
     a = ap.parse_args()
+    a.zip = os.path.abspath(a.zip)   # dump_partitions cd's into workdir; zip path must be absolute
     tdir = os.path.join(HERE, "targets", a.name); os.makedirs(tdir, exist_ok=True)
     scratch = os.path.join(HERE, "build"); os.makedirs(scratch, exist_ok=True)   # on disk, not tmpfs
     wd = tempfile.mkdtemp(prefix="port_", dir=scratch)
