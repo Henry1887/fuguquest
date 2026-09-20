@@ -22,6 +22,7 @@ _start:
 anchor:
     bl  0                        // CALL26 -> __platform_driver_register (patched offset; never executed)
 skip:
+@GUARD@
     // enforcing = 0 : selinux_state = pdr + DSEL
     movz w1, #0                  // [P0] DSEL_lo
     movk w1, #0, lsl #16         // [P1] DSEL_hi

