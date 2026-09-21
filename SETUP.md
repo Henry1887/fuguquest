@@ -1,117 +1,87 @@
-# Setup — external dependencies (Linux & Windows)
+# Setup — dependencies (Linux & Windows)
 
-The scripts are pure Python and OS-independent, but they shell out to a few external tools. Install
-the ones for what you'll run, then point `toolconf.py` (or env vars) at them.
+There are two separate jobs with very different requirements:
 
-> Always install with **`python -m pip …`** (not bare `pip`) so packages land in the *same*
-> interpreter that runs `python orchestrate.py` — a `pip`/`python` mismatch is the usual cause of
-> `ModuleNotFoundError: No module named 'Crypto'` even though pip says it's already satisfied.
+| Job | Needs | Notes |
+|-----|-------|-------|
+| **Run the exploit** (`fuguquest`) | **Rust toolchain** (to build once) + **adb** | No clang, no LLVM, no Python, no pip. The binary is self-contained. |
+| **Add a new firmware target** (`port.py`) | **Python 3.8+** + adb + extraction tools | payload-dumper-go, debugfs, vmlinux-to-elf, llvm-readelf/nm |
 
-| Tool | Needed by | `toolconf.py` / env var | Notes |
-|------|-----------|-------------------------|-------|
-| **Python 3.8+** | everything | — | run scripts with `python` / `python3` |
-| **pycryptodome** | `orchestrate.py` (OPTIONAL) | — (pip) | speedup only; a pure-Python AES fallback is built in, so it's not required |
-| **adb** (platform-tools) | `orchestrate.py`, `port.py --device` | on PATH | Google platform-tools |
-| **clang** | `orchestrate.py`, `build_credmod.py`, `port.py` | `AOSP_CLANG_BIN` (the `bin/` dir) | ≥ v14; only assembles AArch64 asm. Running needs ONLY clang (ELF read is pure-Python). |
-| **llvm-readelf**, **llvm-nm** | `port.py` only | `AOSP_CLANG_BIN` | for adding targets; not needed to run |
-| **payload-dumper-go** | `port.py` | `PAYLOAD_DUMPER` (full path to the binary) | extracts OTA partitions |
-| **debugfs** (e2fsprogs) | `port.py` | `DEBUGFS` (default: `debugfs` on PATH) | reads files out of ext4 partition images |
-| **vmlinux-to-elf** | `port.py` | `VMLINUX_TO_ELF` (default: `vmlinux-to-elf` on PATH) | boot.img → vmlinux with symbols |
-| Android **NDK** | *only* rebuilding `e2e.dex`/native (optional) | `NDK_BIN` | `e2e.dex` is prebuilt & committed — skip unless changing the Java |
-
-**Minimum to run the exploit** (`orchestrate.py`): Python + adb + **clang** (just clang — ELF
-parsing is pure-Python, so llvm-objcopy/readelf/nm are NOT needed). pycryptodome is an optional speedup.
-**To add a new firmware target** (`port.py`): also payload-dumper-go + debugfs + vmlinux-to-elf.
+If someone hands you a ready `targets/<name>.json` (+ its `targets/<name>/` binaries), you only need
+the first row: build the binary and run it.
 
 ---
 
-## Linux
+## Run the exploit
 
-```bash
-# Python libs
-# RUN the exploit needs NO pip packages (built-in pure-Python AES). Optional speedup:
-python3 -m pip install --user pycryptodome                      # optional
-python3 -m pip install --user -r requirements-port.txt         # only to ADD targets (vmlinux-to-elf)
+### 1. Rust toolchain (build the binary — once)
+- **Linux:** `curl https://sh.rustup.rs -sSf | sh` (or distro `rust`/`cargo` package), then
+  `cd rust && cargo build --release`.
+- **Windows:** install **rustup** from https://rustup.rs (pick the MSVC or GNU toolchain), then
+  `cd rust` and `cargo build --release` → `rust\target\release\fuguquest.exe`.
 
-# distro packages
-#  Fedora:
-sudo dnf install android-tools clang llvm e2fsprogs
-#  Debian/Ubuntu:
-sudo apt install adb clang llvm e2fsprogs
+The crate has **zero dependencies**, so `cargo build` works fully offline. Output:
+`rust/target/release/fuguquest`. Copy it anywhere; it embeds `e2e.dex` and the post-ex assets.
 
-# payload-dumper-go — grab the linux_amd64 release binary
-#  https://github.com/ssut/payload-dumper-go/releases
-tar xf payload-dumper-go_*_linux_amd64.tar.gz -C ~/Tools/
+Optional fully-static / cross builds:
+```
+rustup target add x86_64-unknown-linux-musl   && cargo build --release --target x86_64-unknown-linux-musl
+rustup target add x86_64-pc-windows-gnu        && cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-Then set the paths (once, e.g. in `~/.bashrc`) — or edit the defaults at the top of `toolconf.py`:
-```bash
-export AOSP_CLANG_BIN=/usr/bin                 # dir holding clang, llvm-objcopy, llvm-readelf, llvm-nm
-export PAYLOAD_DUMPER=$HOME/Tools/payload-dumper-go
-# DEBUGFS / VMLINUX_TO_ELF default to PATH names, so nothing to set if installed above
-```
-> `AOSP_CLANG_BIN` is the directory that *contains* the `clang`/`llvm-*` binaries. On Fedora/Debian
-> that's `/usr/bin`. If you use the AOSP prebuilt instead, point it at
-> `.../clang-r450784e/bin`.
+### 2. adb (platform-tools)
+- **Linux:** `sudo dnf install android-tools` (Fedora) / `sudo apt install adb` (Debian/Ubuntu).
+- **Windows:** download *SDK Platform-Tools* from
+  https://developer.android.com/tools/releases/platform-tools , unzip, add the folder to **PATH**.
+
+That's it — `fuguquest -t targets/<name>.json --adb-root` needs nothing else.
 
 ---
 
-## Windows
+## Add a new firmware target (`port.py`)
 
-Install (PowerShell; `winget` or manual downloads):
-```powershell
-winget install Python.Python.3.12
-winget install LLVM.LLVM                        # -> C:\Program Files\LLVM\bin (clang.exe, llvm-*.exe)
-# RUN the exploit needs NO pip packages (built-in pure-Python AES).
-# python -m pip install pycryptodome               # OPTIONAL speedup (skip on Python 3.14 / no MSVC)
-# python -m pip install -r requirements-port.txt   # ONLY to add targets; minilzo needs MSVC -> use WSL
+Only needed to build a new `targets/*.json` from an OTA zip. `port.py` is Python and shells out to a
+few tools; point `toolconf.py` (or env vars) at them.
+
+| Tool | env var (`toolconf.py`) | Install |
+|------|-------------------------|---------|
+| **Python 3.8+** | — | run with `python3 port.py …` |
+| **payload-dumper-go** | `PAYLOAD_DUMPER` (full path) | release binary from https://github.com/ssut/payload-dumper-go/releases |
+| **debugfs** (e2fsprogs) | `DEBUGFS` (default: on PATH) | `dnf/apt install e2fsprogs` (Windows: use WSL) |
+| **vmlinux-to-elf** | `VMLINUX_TO_ELF` (default: on PATH) | `pip install -r requirements-port.txt` |
+| **llvm-readelf / llvm-nm** | `READELF` / `NM` | `dnf/apt install llvm` (Windows: `winget install LLVM.LLVM`) |
+
+```bash
+# Linux
+sudo dnf install android-tools llvm e2fsprogs        # or: apt install adb llvm e2fsprogs
+python3 -m pip install --user -r requirements-port.txt
+# payload-dumper-go: unpack the linux_amd64 release into ~/Tools/
+export PAYLOAD_DUMPER=$HOME/Tools/payload-dumper-go   # DEBUGFS/VMLINUX_TO_ELF default to PATH names
 ```
-- **adb**: download *SDK Platform-Tools for Windows* from
-  https://developer.android.com/tools/releases/platform-tools , unzip (e.g. `C:\platform-tools`),
-  and add that folder to your **PATH**.
-- **payload-dumper-go**: download the `windows_amd64` release .exe from
-  https://github.com/ssut/payload-dumper-go/releases and save it (e.g.
-  `C:\Tools\payload-dumper-go.exe`).
-- **debugfs**: not native to Windows. Easiest is to **run `port.py` under WSL** (Ubuntu:
-  `sudo apt install e2fsprogs`) — everything else works either way. If you must stay in native
-  Windows, install an e2fsprogs port (Cygwin `e2fsprogs`, or Ext2Fsd/“e2fsprogs for Windows” builds)
-  and point `DEBUGFS` at its `debugfs.exe`.
 
-Then set the paths (PowerShell; use `[Environment]::SetEnvironmentVariable(...,'User')` to persist) —
-or edit `toolconf.py`:
-```powershell
-$env:AOSP_CLANG_BIN = "C:\Program Files\LLVM\bin"
-$env:PAYLOAD_DUMPER = "C:\Tools\payload-dumper-go.exe"
-$env:DEBUGFS        = "C:\cygwin64\bin\debugfs.exe"   # only if not using WSL
-```
-> `toolconf.py` auto-appends `.exe` to the clang/llvm tool names on Windows, so
-> `AOSP_CLANG_BIN` just needs to be the `bin` directory.
-
-> **Recommended split:** run **`orchestrate.py` natively on Windows** (needs only Python +
-> adb + LLVM — no pip packages; pycryptodome optional), and do the occasional **`port.py` under WSL**
-> (where debugfs/vmlinux-to-elf/payload-dumper are trivial). Targets are just JSON + a few small
-> files, so build them once (either OS) and commit them.
+On Windows the cleanest path for `port.py` is **WSL** (debugfs/vmlinux-to-elf/payload-dumper are
+trivial there). Targets are just JSON + a few small files, so build them once (either OS) and commit
+them — then any machine only needs the run-side (Rust + adb).
 
 ---
 
 ## Verify
 
-```bash
-python - <<'PY'
-import shutil, os, importlib.util, subprocess
-import sys; sys.path.insert(0, ".")
+Run side:
+```
+cargo --version && adb version | head -1
+cd rust && cargo build --release && ./target/release/fuguquest --help
+```
+
+Port side (optional):
+```
+python3 - <<'PY'
+import shutil, os, sys; sys.path.insert(0, ".")
 import toolconf as t
-def ok(label, path, run=None):
-    found = os.path.isfile(path) or shutil.which(path)
-    print(f"  {'OK ' if found else 'MISSING'} {label}: {path}")
-print("pycryptodome (optional speedup):", "OK" if importlib.util.find_spec("Crypto") else "absent — using built-in pure-Python AES (fine)")
+def ok(label, path): print(f"  {'OK ' if os.path.isfile(path) or shutil.which(path) else 'MISSING'} {label}: {path}")
 print("adb:", "OK" if shutil.which("adb") else "MISSING")
-ok("clang (required to run)", t.CLANG)
-for lbl, p in [("llvm-readelf [port.py]", t.READELF), ("llvm-nm [port.py]", t.NM),
-               ("payload-dumper-go [port.py]", t.PDG), ("debugfs [port.py]", t.DEBUGFS),
-               ("vmlinux-to-elf [port.py]", t.VMLINUX_TO_ELF)]:
+for lbl, p in [("payload-dumper-go", t.PDG), ("debugfs", t.DEBUGFS), ("vmlinux-to-elf", t.VMLINUX_TO_ELF),
+               ("llvm-readelf", t.READELF), ("llvm-nm", t.NM)]:
     ok(lbl, p)
 PY
 ```
-To RUN the exploit only **clang** must be OK. `llvm-readelf`/`llvm-nm`/`debugfs`/`payload-dumper-go`/
-`vmlinux-to-elf` are only for `port.py` (adding targets). Fix any run-blocker via `toolconf.py` / env.

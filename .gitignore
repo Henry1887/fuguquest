@@ -5,3 +5,7 @@ __pycache__/
 *.o
 *.bin
 *.spec
+
+# Rust build output (fuguquest)
+rust/target/
+fuguquest.zip

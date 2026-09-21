@@ -1,155 +1,132 @@
-# DirtyFrag-LPE — unprivileged SELinux Enforcing→Permissive + root (Quest 3 & Quest Pro)
+# DirtyFrag-LPE — unprivileged SELinux Enforcing→Permissive + root (Quest 3 / 3S / Pro / 2)
 
-Single orchestrator that runs the full zero-root chain: an unprivileged (`uid 2000` shell / any
-app) Dirty-Frag page-cache poison → unsigned kernel module load → `selinux_state.enforcing = 0`.
+A single self-contained binary that runs the full zero-root chain: an unprivileged (`uid 2000` shell
+/ any app) Dirty-Frag page-cache poison → unsigned kernel module load → `selinux_state.enforcing = 0`
+→ optional root (cred-patch) → optional Magisk.
 
-> First time? See **[SETUP.md](SETUP.md)** for external-dependency install (Linux & Windows) and a
-> one-shot environment check. Tool paths live in `toolconf.py` (env-overridable).
+The runtime is a **single OS-independent Rust binary with no external dependencies** — no clang, no
+LLVM, no Python, no pip. It assembles the AArch64 carrier/cred/stub payloads itself, parses/rewrites
+the carrier ELF itself, computes the Dirty-Frag AES-GCM keystream itself, and embeds `e2e.dex` + the
+post-ex assets. The only thing it shells out to is **`adb`**.
+
+> Adding a *new firmware target* still uses `port.py` (Python) — see **[PORTING.md](PORTING.md)** and
+> **[SETUP.md](SETUP.md)**. That's the only part that needs Python + the extraction tools.
+
+## Build
 
 ```
-python3 orchestrate.py --target targets/<name>.json [--device SERIAL] [--settle N] [--verify-root]
-                       [--no-restore | --leave-disabled | --postex | --adb-root]
+cd rust && cargo build --release          # -> rust/target/release/fuguquest  (or .exe on Windows)
 ```
+Zero crates, so it builds offline. For a portable static Linux binary:
+`rustup target add x86_64-unknown-linux-musl && cargo build --release --target x86_64-unknown-linux-musl`.
+Cross-compile for Windows with `x86_64-pc-windows-gnu`.
+
+## Run
+
+```
+fuguquest -t targets/<name>.json [-d SERIAL] [--settle N] [--verify-root]
+          [--no-restore | --leave-disabled | --postex | --adb-root]
+```
+
+**One binary, all devices.** The target JSON's `kernel.merged` flag picks the flow — no rebuild:
+- **Quest 3 / 3S (non-merged, 5.10)** — two-carrier flow (`llcc_perfmon` enforcing carrier +
+  `usbip-vudc` cred carrier). Validated on-device (adb-root ~10 s).
+- **Quest 3S / Quest Pro / Quest 2 (merged)** — one carrier does enforcing=0 + cred-patch together;
+  Q3S uses a `.text`-splice carrier. See below.
 
 ### `--adb-root` — root adb shells without Magisk
 Cred-patches the running **adbd** to `uid 0 + all caps + kernel SELinux context` and leaves SELinux
-**Permissive**, so every **new** `adb shell` is full root — no Magisk, no Zygisk. Use it to get a
-clean root shell (e.g. to isolate Magisk/Zygisk problems). Works on both device families (merged
-carrier on Quest Pro, usbip cred carrier on Quest 3); needs `kernel.cred_security_off` in the target.
+**Permissive**, so every **new** `adb shell` is full root — no Magisk, no Zygisk. Needs
+`kernel.cred_security_off` in the target.
 ```
-python3 orchestrate.py -t targets/<name>.json --adb-root
-# then open a NEW shell:   adb shell   ->   id   # uid=0
+fuguquest -t targets/<name>.json --adb-root
+# then open a NEW shell:   adb shell   ->   id   # uid=0, context u:r:kernel:s0
 ```
 Transient (RAM-only): a reboot fully clears it. Existing shells stay uid 2000; only shells forked
 after the patch are root.
 
-**One file, both devices.** The target JSON's `kernel.merged` flag picks the flow — no code changes:
-- **Quest 3** (5.10) — two-carrier flow. Validated on **5234532** (unit B, ~18 s) and **5243367**
-  (unit A, locked retail, ~20 s).
-- **Quest Pro** (4.19) — merged single-carrier flow (`targets/QPro_51483620027600340.json`); see
-  [Quest Pro](#quest-pro-merged-single-carrier) below.
-
-### Quest Pro (merged single-carrier)
-Quest Pro's 4.19 kernel differs (`selinux_state.enforcing @ +1`, `task_struct.cred @ 0x7e8`) and,
-critically, its **only** not-loaded module with a big-enough init is `rdbg` (680 B) — `llcc_perfmon`
-is already loaded, and the small USB-net modules (≤168 B init) can't hold the 196 B cred-patch. So a
-single carrier does everything: `build_credmod` diff-patches `rdbg` into
-`enforcing=0 + status-page-sync + cred-patch(waiting-shell pid)`, and it is loaded **once** →
-Permissive **and** root together. Because `rdbg` is `vendor_file` (shell can't read it under
-Enforcing) it's poisoned by a **1-file** `init_array` ctor injected into `libgralloc.qti.so` (a
-`same_process_hal_file` lib mapped by `trackingservice`, 3.7 KB code gap); the cfg *is* shell-readable
-under Enforcing here, so shell poisons it directly. All values (deltas, offsets) verified statically
-from the firmware + BTF. Run:
-
+### Merged flow (Quest Pro 4.19 / Quest 2 / Quest 3S)
+The merged carrier does everything in one module load: `build_credmod` diff-patches the carrier into
+`enforcing=0 + status-page-sync + cred-patch`, loaded **once** → Permissive **and** root together.
+The carrier is `vendor_file`/`vendor_dlkm` (shell can't read it under Enforcing) so it's poisoned by
+an `init_array` ctor injected into a `same_process_hal_file` lib mapped by `trackingservice`
+(`libgralloc.qti` on QPro, `libcdsprpc` on Q3S). QPro's cfg is shell-readable under Enforcing (1-file
+ctor); Q3S's isn't (2-file ctor). Quest Pro's `bl __platform_driver_register` routes through a PLT
+veneer, so the anchor is an **R_AARCH64_ABS64** slot the loader fills with the real address
+(veneer-proof); Q3S's `llcc_perfmon` has a 52 B `.init.text` so the patch goes in `.text` with
+`module->init` repointed (`.text`-splice).
 ```
-python3 orchestrate.py -t targets/QPro_51483620027600340.json --postex        # -> Permissive + uid 0 + Magisk
+fuguquest -t targets/QPro_51483620027600340.json --postex     # -> Permissive + uid 0 + Magisk
+fuguquest -t targets/q3s_<build>.json --adb-root
 ```
 
-> Status: on-device run #1 confirmed the chain executes end-to-end — rdbg loaded and our patched
-> `init_module` ran (panic log). It panicked because 4.19 routes the module's
-> `bl __platform_driver_register` through a **PLT veneer**, so decoding the bl gave the veneer, not
-> the symbol. Fixed: the anchor is now an **R_AARCH64_ABS64** slot the loader fills with the real
-> address (no CALL26/veneer). Remaining on-device unknowns: `module.sig_enforce` off (rdbg loaded, so
-> likely off), and Magisk setup. Dirty-Frag itself is **confirmed on 4.19**.
-
-### Post-exploitation (`--postex`) — unprivileged → uid 0 root → Magisk
+### Post-exploitation (`--postex`) — unprivileged → uid 0 → Magisk
 After reaching Permissive, roots a shell and sets up Magisk, **no per-kernel compilation**:
-1. shell writes a **diff-patched cred carrier** (`usbip-vudc.ko`, not-loaded, 408 B init) to
-   `/data/local/tmp/uv.ko` — its init reads `&__platform_driver_register` from an ABS64 anchor and
-   cred-patches a waiting shell's `task->cred` to uid 0 + all caps (anchor-relative `find_vpid`/
-   `pid_task`/`selinux_state`, per-kernel deltas from the target JSON);
-2. shell poisons the cfg (permissive ⇒ DAC read) to `insmod|/data/local/tmp/uv.ko`;
+1. host builds a **diff-patched cred carrier** in-process and pushes it to `/data/local/tmp/uv.ko`
+   (its init reads `&__platform_driver_register` from an ABS64 anchor and cred-patches a waiting
+   shell to uid 0 + all caps; anchor-relative `find_vpid`/`pid_task`/`selinux_state` deltas from JSON);
+2. shell poisons the cfg (permissive ⇒ DAC read) → `insmod|/data/local/tmp/uv.ko`;
 3. `ctl.start insmod_sh` loads uv.ko → the waiting shell becomes **uid 0** (polled to confirm);
-4. that root shell runs `postex/postex.sh`: drop_caches → rmmod both carriers →
-   `singularity_magisk.sh` (Singularity Magisk v30.7 fork, from `postex/assets/`) → `setenforce 1`.
+4. that root shell runs `postex/postex.sh`: drop_caches → rmmod carriers →
+   `singularity_magisk.sh` (Singularity Magisk fork, embedded) → `setenforce 1`.
 
-```
-python3 orchestrate.py -t targets/<name>.json --postex [--skip-magisk]
-```
-**Proven on locked retail A (~40 s):** a fresh unprivileged `adb shell` → `su -c id` = **uid 0,
-`u:r:magisk:s0`, under SELinux Enforcing**. Magisk (Singularity v30.7 fork) daemon + manager live.
+Two things that make it work: the carrier also calls `selinux_status_update_setenforce(&state,0)` so
+userspace `/sys/fs/selinux/status` goes permissive (magiskpolicy applies), and the payload is a
+Quest-tuned Singularity fork (`SL_RESTART_ZYGOTE=0`, no zygote restart).
 
-Two things that made it work:
-- **SELinux status-page sync** — the carrier flips `enforcing=0` by a direct memory write, which
-  updates the kernel AVC but *not* the `/sys/fs/selinux/status` page userspace reads, so init kept
-  enforcing (setprop/ctl.stop/magiskpolicy denied). The usbip carrier now also calls
-  `selinux_status_update_setenforce(&selinux_state,0)` (anchor-relative) → userspace truly
-  permissive → magiskpolicy applies → after the final `setenforce 1`, headless `su` works under
-  enforcing.
-- **Payload = `singularity_magisk.sh`** (Quest-tuned v30.7 fork, `SL_RESTART_ZYGOTE=0`) instead of
-  the AVD `live_setup.sh`: no zygote restart (the AVD script's `stop`/`start` was ~181 s of the old
-  219 s total) and no `memfd_file` magiskpolicy error. Zygisk isn't injected into already-running
-  procs (set `SL_RESTART_ZYGOTE=1` for that), but `su` works.
-
-Both carriers are still **diff-patched existing modules** (llcc_perfmon = enforcing; usbip-vudc =
-cred-patch + status-page sync), so a new kernel needs only the JSON deltas — no compilation.
-
-### Cleanup modes (what happens after Permissive is reached)
-- **default** — `setenforce 1; rmmod; reboot` → device fully clean (Enforcing). Needs root only on a
-  rooted validation unit; on a locked unit the reboot alone restores.
-- **`--leave-disabled`** — reverts the *code-injection* poisons (libeva ctor + libandroid dump) via
-  shell, **no reboot, SELinux stays Permissive**. For handing off to a post-exploitation script.
-  Residue left (benign, cleared later once root): the carrier/cfg page-cache poison + the loaded
-  `llcc_perfmon`. (`--postex` does this whole hand-off automatically; use `--leave-disabled` only to
-  drive post-ex by hand.)
+### Cleanup modes (after Permissive is reached)
+- **default** — `setenforce 1; rmmod; reboot` → device clean (Enforcing).
+- **`--leave-disabled`** — revert the code-injection poisons (shell, no reboot), keep Permissive.
+- **`--adb-root`** — cred-patch adbd, keep Permissive, no Magisk (transient, reboot clears).
+- **`--postex`** — root via insmod_sh cred carrier → Singularity Magisk → setenforce 1.
 - **`--no-restore`** — leave everything poisoned & permissive (debugging).
 
-`--settle N` (default 8) is how long to wait for the ctor's carrier/cfg poison to finish after the
-trackingservice restart, before firing `insmod_sh`. Do not lower it — re-triggering would revert
-the poison.
+`--settle N` (default 3) waits for the ctor's carrier/cfg poison after the trackingservice restart.
 
 ## Chain (all steps as uid-2000 shell, no su)
 1. **stage** attacker-keyed AES-GCM ESP SA via IpSecService (`q3.Stager`)
-2. **poison `libeva.so`**: redirect `init_array[0]` (RELR slot) → a 2-file poison stub planted in
-   libeva's ~1.8 KB code gap
+2. **poison the inject lib** (`libeva`/`libgralloc.qti`/`libcdsprpc`): redirect `init_array[0]` → a
+   1/2-file poison stub planted in the lib's code gap
 3. **poison `libandroid_servers.so::dump`** → a `ctl.restart trackingservice` stub
-4. **`dumpsys input`** → system_server restarts trackingservice → the libeva ctor runs in
-   `hal_tracking_default` and page-cache-poisons the carrier `.ko` (48-byte enforcing=0 patch) +
-   `init.insmod.cfg` (adds an `insmod` line)
-5. **`setprop ctl.start insmod_sh`** → `init-insmod-sh` finit_modules the poisoned carrier →
-   kernel loads the unsigned module → `enforcing = 0`
+4. **`dumpsys input`** → system_server restarts trackingservice → the injected ctor runs in
+   `hal_tracking_default` and page-cache-poisons the carrier `.ko` (+ `init.insmod.cfg`)
+5. **`setprop ctl.start insmod_sh`** → init `finit_module`s the poisoned carrier → unsigned module
+   loads → `enforcing = 0` (merged carrier also cred-patches to uid 0)
 
-Key optimization: **diff-injection** — the target module is the *real* carrier with a 52-byte
-in-place init patch (the enforcing carrier decodes its own `bl` anchor; the cred/merged carrier uses
-an ABS64 anchor the loader fills — veneer-proof — see `cred_patch.S.tmpl`),
-so only ~48 bytes need poisoning and the whole IV table fits libeva's existing gap (no 78 KB table).
+Key optimization: **diff-injection** — the carrier is the *real* module with an in-place init patch
+(enforcing carrier decodes its own `bl` anchor; cred/merged carrier uses a loader-filled ABS64 anchor
+— veneer-proof), so only tens of bytes need poisoning and the whole IV table fits the lib's gap.
 
 ## Files
-- `orchestrate.py`   — the whole pipeline (build + stage + poison + trigger + verify + post-ex/cleanup);
-  dispatches two-carrier (`run`) vs merged (`run_merged`) on `kernel.merged`
-- `SETUP.md`         — external-dependency install for Linux & Windows + environment self-check
-- `requirements.txt` — running needs NO pip packages (built-in pure-Python AES; pycryptodome
-  optional speedup); add-target extra in `requirements-port.txt`
-- `elfutil.py`       — tiny pure-Python ELF reader so running needs only clang (no objcopy/readelf)
-- `toolconf.py`      — ONE place for all external tool paths (clang/objcopy/readelf/nm, NDK,
-  payload-dumper, debugfs, vmlinux-to-elf); env vars override. Imported by the scripts below.
-- `port.py`          — gather a new firmware's values → draft `targets/<name>.json` (+ binaries);
-  `--merged` emits the single-carrier shape (Quest Pro)
-- `build_credmod.py` — diff-patch the cred carrier (usbip-vudc on Q3, rdbg on QPro); takes
-  `enf_off`/`cred_off` so one template covers 5.10 and 4.19
-- `PORTING.md`       — how to add a new firmware (automated + manual, both device families)
-- `targets/*.json`   — per-firmware constants/offsets/paths (q3_<build>, QPro_<build> — named after the OTA zip)
-- `targets/<name>/`   — that firmware's gathered binaries: carrier `.ko` (llcc_perfmon on Q3, rdbg
-  on QPro), `init.insmod.cfg` (+ `usbip-vudc.ko` on Q3)
-- `asm/` — `patch_init.S` (llcc enforcing patch, embedded in orchestrate.py), the injection ctor
-  stub (generated in-code by `build_inject_stub`, N-file / dynamic tables), `libas_restart.S.tmpl`
-  (system_server restart stub), `cred_patch.S.tmpl` (cred-patch + status-page sync; `@ENF_OFF@`/
-  `@CRED_OFF@` substituted per target)
+- `rust/`            — the orchestrator + all host logic (one binary, no deps, no clang). Builds
+  everything the old `orchestrate.py`/`build_credmod.py`/`elfutil.py` did, in-process:
+  - `src/asm.rs` — two-pass AArch64 assembler (replaces the clang assemble step)
+  - `src/aes.rs` — AES-128 keystream (Dirty-Frag)
+  - `src/elf.rs` — ELF64 reader/mutator (carrier splice + reloc rewrite)
+  - `src/emit.rs` — carrier init patch, cred-patch, inject stub, libandroid stub, build_carrier/cfg
+  - `src/credmod.rs` — merged/cred carrier builder (`.init.text` + `.text`-splice modes)
+  - `src/orchestrate.rs` — the full pipeline (both flows, all cleanup modes)
+  - `src/adb.rs` — adb wrapper + background Stager / WaitShell
+  - embeds `e2e.dex` + `postex/*` via `include_bytes!`
+- `port.py`          — (Python) gather a new firmware's values → draft `targets/<name>.json`;
+  `--merged`/`--cfg-ctor` emit the merged / Q3S shapes
+- `toolconf.py`      — external tool paths for `port.py` (readelf/nm/debugfs/vmlinux-to-elf/payload-dumper)
+- `SETUP.md`         — dependency install (run = Rust+adb; port = Python+tools) for Linux & Windows
+- `PORTING.md`       — how to add a new firmware (both device families)
+- `requirements-port.txt` — Python extras for `port.py` only (vmlinux-to-elf)
+- `targets/*.json`   — per-firmware constants/offsets/paths (named after the OTA zip)
+- `targets/<name>/`  — that firmware's gathered binaries (carrier `.ko`, cfg, cred carrier on Q3)
+- `asm/*.S.tmpl`     — reference asm the Rust emitters mirror (no longer used at runtime)
 - `java/Stager.java`, `java/Writer.java` → `e2e.dex` — firmware-independent Dirty-Frag primitives
-- `postex/postex.sh` + `postex/assets/{singularity_magisk.sh, singularity-Magisk.apk}` — the root payload
+- `postex/…`         — the root payload (embedded in the binary)
 
 ## Adding a new firmware
-One command (see `PORTING.md` for details + the manual equivalent):
-
 ```
-python3 port.py --zip q3_<build>.zip            # OTA-only; name defaults to the zip basename
-python3 orchestrate.py -t targets/q3_<build>.json
+python3 port.py --zip q3_<build>.zip          # OTA-only; name defaults to the zip basename
+fuguquest -t targets/q3_<build>.json
 ```
-
-`port.py` extracts the carrier/cfg/vmlinux from the exact-build zip, computes DELTA, and derives
-libeva/libandroid offsets from the device's own libs. No code changes — the orchestrator auto-derives
-the carrier ELF layout and repoints its relocations. Only `vermagic` + `delta_selinux_from_anchor`
-have differed between builds so far (userspace libs unchanged).
+See **[PORTING.md](PORTING.md)**. `port.py` extracts the carrier/cfg/vmlinux, computes the
+anchor-relative deltas, and derives the inject-lib/libandroid offsets. No code changes to run it.
 
 > Authorized bug-bounty research only. `--no-restore` leaves the device permissive; the default
 > restores (setenforce 1; rmmod; reboot).
