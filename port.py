@@ -2,8 +2,12 @@
 # port.py — gather everything needed for a new firmware target and emit targets/<name>.json.
 #
 #   Quest 3 (two-carrier):  python3 port.py --zip q3_<build>.zip
-#   Quest Pro (merged):     python3 port.py --zip QPro_<build>.zip --merged --carrier rdbg \
+#   Quest Pro / Q2 (merged):python3 port.py --zip QPro_<build>.zip --merged --carrier rdbg \
 #                             --inject-lib libgralloc.qti.so --enforcing-off 1 --cred-off 0x7e8
+#   Quest 3S (merged 5.10):  python3 port.py --zip q3s_<build>.zip --merged --carrier llcc_perfmon \
+#                             --inject-lib libcdsprpc.so --cfg-ctor
+#     (Q3S has no usbip cred carrier; llcc's 52B .init.text forces build_credmod's .text-splice, and
+#      the 5.10 cfg isn't shell-readable under Enforcing -> --cfg-ctor. enforcing/cred default to 5.10.)
 #
 # Fully OTA-only — no device needed (carrier/cfg/libs/kernel all come from the zip). --device just
 # speeds it up (skips the 1.2GB system dump by adb-pulling libandroid_servers instead). The target
@@ -123,6 +127,9 @@ def main():
                     help="task_struct->cred offset (5.10=0x778, 4.19=0x7e8; confirm via BTF)")
     ap.add_argument("--cred-security-off", default="0x78",
                     help="cred->security offset for --adb-root's kernel-context patch (0x78 on 5.10 & 4.19)")
+    ap.add_argument("--cfg-ctor", action="store_true",
+                    help="merged: cfg is NOT shell-readable under Enforcing (Q3 family / Quest 3S) so "
+                         "the init_array ctor poisons it too (2-file). Default (QPro/Q2 4.19): shell-direct.")
     a = ap.parse_args()
     a.zip = os.path.abspath(a.zip)   # absolute so it resolves regardless of the scratch workdir
     # naming scheme: target name == the OTA zip basename (e.g. QPro_51483620027600340, q3_<build>)
@@ -231,7 +238,7 @@ def main():
                                "dump_off": hex(dump_off), "dump_size": dump_sz},
         "cfg": {"device_path": "/vendor/etc/init.insmod.cfg", "local_cfg": f"{a.name}/init.insmod.cfg",
                 "inject_off": "0x21", "inject_len": 54,
-                **({"shell_poison_under_enforcing": True} if a.merged else {})},
+                **({"shell_poison_under_enforcing": True} if (a.merged and not a.cfg_ctor) else {})},
         "services": {"tracking": "trackingservice", "insmod_sh": "insmod_sh"},
         "property_socket": "/dev/socket/property_service",
     }
