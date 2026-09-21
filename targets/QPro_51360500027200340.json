@@ -1,0 +1,53 @@
+{
+  "name": "QPro_51360500027200340",
+  "description": "build 51360500027200340, kernel 4.19.325-cip124-st8-g42f3e978eeed (MERGED single-carrier)",
+  "device": {
+    "build_incremental": "51360500027200340",
+    "vermagic": "4.19.325-cip124-st8-g42f3e978eeed"
+  },
+  "dirtyfrag": {
+    "sa_spi": "0xdeadbe10",
+    "writer_spi": "0xdeadbe11",
+    "keymat_base": "0x41"
+  },
+  "kernel": {
+    "anchor_symbol": "__platform_driver_register",
+    "enforcing_off": 1,
+    "cred_off": "0x7e8",
+    "cred_security_off": "0x78",
+    "merged": true,
+    "delta_selinux_from_anchor": "0x162c198",
+    "delta_findvpid_from_anchor": "0xff95e12c",
+    "delta_pidtask_from_anchor": "0xff95e38c",
+    "delta_ssuse_from_anchor": "0xffd200e0"
+  },
+  "carrier": {
+    "device_path": "/vendor/lib/modules/rdbg.ko",
+    "local_ko": "QPro_51360500027200340/rdbg.ko",
+    "anchor_reloc_off": "0x14"
+  },
+  "inject_lib": {
+    "device_path": "/vendor/lib64/libgralloc.qti.so",
+    "init_array_off": "0x8210",
+    "orig_ctor_off": "0x3030",
+    "stub_gap_off": "0x6160",
+    "stub_gap_size": 3744
+  },
+  "libandroid_servers": {
+    "device_path": "/system/lib64/libandroid_servers.so",
+    "dump_off": "0x6b190",
+    "dump_size": 836
+  },
+  "cfg": {
+    "device_path": "/vendor/etc/init.insmod.cfg",
+    "local_cfg": "QPro_51360500027200340/init.insmod.cfg",
+    "inject_off": "0x21",
+    "inject_len": 54,
+    "shell_poison_under_enforcing": true
+  },
+  "services": {
+    "tracking": "trackingservice",
+    "insmod_sh": "insmod_sh"
+  },
+  "property_socket": "/dev/socket/property_service"
+}

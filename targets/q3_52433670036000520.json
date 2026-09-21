@@ -13,11 +13,13 @@
   "kernel": {
     "anchor_symbol": "__platform_driver_register",
     "enforcing_off": 0,
+    "cred_off": "0x778",
+    "cred_security_off": "0x78",
+    "merged": false,
     "delta_selinux_from_anchor": "0x1ecb1a8",
     "delta_findvpid_from_anchor": "0xff788084",
     "delta_pidtask_from_anchor": "0xff5a8e98",
-    "delta_ssuse_from_anchor": "0xffcc5204",
-    "cred_security_off": "0x78"
+    "delta_ssuse_from_anchor": "0xffcc5204"
   },
   "carrier": {
     "device_path": "/vendor/lib/modules/llcc_perfmon.ko",
