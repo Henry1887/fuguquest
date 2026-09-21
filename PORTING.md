@@ -41,7 +41,7 @@ reads `build_incremental` from `system.img` build.prop (or the device), then wri
   before EOF** (sendfile can't send 17 B past EOF). `0x21`/`54` fits the standard 268-B cfg.
 - `libeva.stub_gap_*` is a zero run in an executable segment (≥ ~1.7 KB).
 
-Then run: `python3 orchestrate.py -t targets/quest3-<short>.json`.
+Then run: `fuguquest -t targets/quest3-<short>.json`.
 
 ---
 
@@ -106,7 +106,7 @@ Quest Pro's 4.19 kernel needs a different shape, all target-driven (`kernel.merg
 ```
 python3 port.py --zip QPro_<build>.zip --name questpro-<short> --merged \
   --carrier rdbg --inject-lib libgralloc.qti.so --enforcing-off 1 --cred-off 0x7e8 --device <SERIAL>
-python3 orchestrate.py -t targets/questpro-<short>.json --postex
+fuguquest -t targets/questpro-<short>.json --postex
 ```
 
 `port.py --merged` extracts `rdbg` + cfg (QPro keeps modules in `vendor.img:/lib/modules`), computes
@@ -134,7 +134,7 @@ The 5.10 cfg isn't shell-readable under Enforcing, so the ctor poisons it too (`
 ```
 python3 port.py --zip q3s_<build>.zip --merged --carrier llcc_perfmon \
   --inject-lib libcdsprpc.so --cfg-ctor
-python3 orchestrate.py -t targets/q3s_<build>.json --adb-root          # or --postex
+fuguquest -t targets/q3s_<build>.json --adb-root          # or --postex
 ```
 
 Confirm on-device (as with QPro's gralloc injection): `trackingservice` maps `libcdsprpc` and it's
