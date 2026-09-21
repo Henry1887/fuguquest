@@ -119,3 +119,24 @@ pulled via adb (QPro's `system` isn't a standalone payload partition).
 `libgralloc.qti.so` shell-readable, `dumpsys input` restarts `trackingservice`, and the injection
 stub still fits the lib's gap (`build_inject_stub` errors if not — pick a lib with a bigger gap, e.g.
 `libcdsprpc.so`, listed in the target as `inject_lib`).
+
+---
+
+## Quest 3S (merged 5.10 via .text-splice)
+
+Q3S is the Q3 5.10 chain but **has no `usbip-vudc`**, and its only not-loaded patchable module is
+`llcc_perfmon` whose `.init.text` is 52 B. So it uses a merged single carrier where the cred+enforcing
+patch goes in llcc's large `.text` (build_credmod auto-detects the small `.init.text` and does the
+`.text`-splice: repoints `module->init`, plants the ABS64 anchor via a repurposed `.text` reloc).
+The 5.10 cfg isn't shell-readable under Enforcing, so the ctor poisons it too (`--cfg-ctor`), and
+`libeva`'s gap is too small for the merged carrier — use `libcdsprpc` (bigger gap).
+
+```
+python3 port.py --zip q3s_<build>.zip --merged --carrier llcc_perfmon \
+  --inject-lib libcdsprpc.so --cfg-ctor
+python3 orchestrate.py -t targets/q3s_<build>.json --adb-root          # or --postex
+```
+
+Confirm on-device (as with QPro's gralloc injection): `trackingservice` maps `libcdsprpc` and it's
+`same_process_hal_file` (shell-readable). If not, pick another trackingservice-mapped, shell-readable
+lib with a ≥ ~3.7 KB exec gap for `--inject-lib`.
