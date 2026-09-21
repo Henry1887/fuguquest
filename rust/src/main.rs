@@ -35,7 +35,7 @@ usage: fuguquest -t targets/<name>.json [options]
   --adb-root            no Magisk: cred-patch adbd to uid0+caps+kernel ctx, leave Permissive
   --skip-magisk         post-ex without the Magisk step
   --verify-root         use su to confirm poison/module (validation only)
-  --settle <sec>        ctor settle after restart (default 3)
+  --settle <sec>        ctor settle after restart, seconds (fractional ok, e.g. 0.5; default 0.3)
 
   (default cleanup, if none of the above: reboot to restore Enforcing)
 
@@ -47,7 +47,7 @@ fn run_cli(a: &[String]) {
     let mut cleanup = Cleanup::Reboot;
     let mut skip_magisk = false;
     let mut verify_root = false;
-    let mut settle: u64 = 3;
+    let mut settle_ms: u64 = 300;
     let mut i = 1;
     while i < a.len() {
         match a[i].as_str() {
@@ -59,7 +59,7 @@ fn run_cli(a: &[String]) {
             "--adb-root" => cleanup = Cleanup::AdbRoot,
             "--skip-magisk" => skip_magisk = true,
             "--verify-root" => verify_root = true,
-            "--settle" => { i += 1; settle = i64a(a.get(i).unwrap_or_else(|| die("missing settle"))) as u64; }
+            "--settle" => { i += 1; let s = a.get(i).unwrap_or_else(|| die("missing settle")); settle_ms = (s.parse::<f64>().unwrap_or_else(|_| die("bad settle")) * 1000.0) as u64; }
             "-h" | "--help" => { println!("{}", USAGE); return; }
             other => die(&format!("unknown arg {}", other)),
         }
@@ -68,7 +68,7 @@ fn run_cli(a: &[String]) {
     let target = target.unwrap_or_else(|| { eprintln!("{}", USAGE); die("missing -t/--target"); });
     log::init();
     let t = Target::load(&target);
-    orchestrate::run(&t, device.as_deref(), cleanup, verify_root, settle, skip_magisk);
+    orchestrate::run(&t, device.as_deref(), cleanup, verify_root, settle_ms, skip_magisk);
 }
 
 fn main() {

