@@ -129,8 +129,11 @@ public class Writer {
                         Thread.sleep(2);
                     }
                 }
-                Thread.sleep(1);   // pacing; the on-device ctor poisons sleeplessly, so 1ms is ample
                 wrote++;
+                // Pace by BURST, not per-packet: yield 1ms every 64 sends so the in-flight burst
+                // never exceeds 64 — below the on-device ctor's proven-safe 98 sleepless sends —
+                // without paying ~1ms * (records) (was the dominant cost of a large poison).
+                if ((wrote & 63) == 0) Thread.sleep(1);
             }
             r.close();
             Os.close(f);
