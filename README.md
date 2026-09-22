@@ -117,7 +117,13 @@ Key optimization: **diff-injection** — the carrier is the *real* module with a
 - `targets/*.json`   — per-firmware constants/offsets/paths (named after the OTA zip)
 - `targets/<name>/`  — that firmware's gathered binaries (carrier `.ko`, cfg, cred carrier on Q3)
 - `asm/*.S.tmpl`     — reference asm the Rust emitters mirror (no longer used at runtime)
-- `java/Stager.java`, `java/Writer.java` → `e2e.dex` — firmware-independent Dirty-Frag primitives
+- `agent/` — native aarch64 `dfpoison` helper (dep-free Rust, bionic externs) that does the hot-path
+  page-cache poison with ~ms startup instead of a Java Writer JVM (~0.6s ART cold start). Prebuilt +
+  committed as `./dfpoison` and embedded in `fuguquest`; rebuild with
+  `cd agent && cargo build --release --target aarch64-linux-android` (needs the NDK linker — see
+  `agent/.cargo/config.toml`) then `cp agent/target/aarch64-linux-android/release/dfpoison ./dfpoison`.
+- `java/Stager.java`, `java/Writer.java` → `e2e.dex` — Dirty-Frag SA stager (Java, holds the SA) +
+  Writer (still used by the merged flow and post-ex reverts)
 - `postex/…`         — the root payload (embedded in the binary)
 
 ## Adding a new firmware

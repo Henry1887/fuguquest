@@ -3,6 +3,9 @@
 use std::path::{Path, PathBuf};
 
 pub const E2E_DEX: &[u8] = include_bytes!("../../e2e.dex");
+// native aarch64 Dirty-Frag poison helper (replaces the Java Writer JVMs on the hot path); built
+// from agent/ via `cargo build --release --target aarch64-linux-android` and copied to ../../dfpoison.
+pub const DFPOISON: &[u8] = include_bytes!("../../dfpoison");
 pub const POSTEX_SH: &[u8] = include_bytes!("../../postex/postex.sh");
 pub const SINGULARITY_SH: &[u8] = include_bytes!("../../postex/assets/singularity_magisk.sh");
 pub const SINGULARITY_APK: &[u8] = include_bytes!("../../postex/assets/singularity-Magisk.apk");
