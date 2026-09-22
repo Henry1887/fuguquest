@@ -9,3 +9,6 @@ __pycache__/
 # Rust build output (fuguquest)
 rust/target/
 fuguquest.zip
+
+# native agent build output
+agent/target/
