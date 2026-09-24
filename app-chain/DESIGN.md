@@ -9,9 +9,27 @@ processes.
 It does **not** replace or modify the primary chain (`../rust` orchestrator, run via `adb shell
 fuguquest` or `--local`). That remains option #1. This folder is option #2.
 
-> Status: the **reachability is proven on Q3** (sepolicy + runtime, build 52433670036000520; see
-> "Evidence"). Two steps are engineering-in-progress and flagged **[OPEN]** below. Treat this as a
-> validated design + working scaffold, not a turnkey exploit yet.
+> **STATUS: REFUTED on-device (Q3, build 52433670036000520).** The `assistant_app` deputy does NOT
+> work: com.oculus.assistant is a **zygote fork**, and every big-gap SP-HAL lib it maps
+> (libvmmem, libgralloc.qti, libgsl, …) is **zygote-preloaded** — the app inherits zygote's
+> already-init'd COW mapping (same inode/offset, verified) and **never re-runs those libs' init_array**,
+> so the page-cache poison of ctor B is inert in it. The only libs the assistant loads *fresh* post-fork
+> (libllvm-glnext/qgl) have 2-byte code gaps — too small for the stub. End-to-end test: builds +
+> poisons all succeeded, assistant cold-launched, but ctor B never ran (trackingservice never bounced,
+> no SELinux flip).
+>
+> Root cause is general: **any zygote-forked app domain inherits preloaded libs**, so a DirtyFrag
+> page-cache poison of those libs can only fire in processes that *fresh-dlopen* them — i.e. **native
+> daemons** (like trackingservice, which is why ctor A / the primary chain works), not apps. The
+> `ctl.start`-capable **native** daemons are `init` (uninjectable) and `syncboss` (dormant +
+> app-unreachable); `shell` needs adb. So there is **no app-only path to fire `ctl.start insmod_sh`**,
+> and the adb-wireless bridge (primary chain / `--local`) remains necessary. This folder is kept as a
+> documented negative result + the validated sub-mechanisms below.
+>
+> What WAS validated on-device: ctor B assembles/plants correctly (358 B, libvmmem gap); the property
+> triggers themselves work from a ctl.start/stop-capable domain — `ctl.stop trackingservice;
+> ctl.start trackingservice` restarts it (8652→9344) and `ctl.start insmod_sh` fires. The gap is
+> purely *delivering* ctor B into a running setter, which zygote preload prevents.
 
 ---
 
