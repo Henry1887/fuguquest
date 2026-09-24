@@ -1,0 +1,4 @@
+# Cross-compile the on-device (--local) build:
+#   cargo build --release --target aarch64-linux-android
+[target.aarch64-linux-android]
+linker = "/home/henry/Tools/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"

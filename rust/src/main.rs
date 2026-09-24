@@ -36,6 +36,9 @@ usage: fuguquest -t targets/<name>.json [options]
   --skip-magisk         post-ex without the Magisk step
   --verify-root         use su to confirm poison/module (validation only)
   --settle <sec>        ctor settle after restart, seconds (fractional ok, e.g. 0.5; default 0.3)
+  --local               run ON-DEVICE in the shell session (commands via `sh -c`, no adb round-trips);
+                        drive with one `adb shell fugu --local ...` over an adb-wireless self-connect
+  -t <dir>|auto         instead of a .json, auto-pick the target matching ro.build.version.incremental
 
   (default cleanup, if none of the above: reboot to restore Enforcing)
 
@@ -48,6 +51,7 @@ fn run_cli(a: &[String]) {
     let mut skip_magisk = false;
     let mut verify_root = false;
     let mut settle_ms: u64 = 300;
+    let mut local = false;
     let mut i = 1;
     while i < a.len() {
         match a[i].as_str() {
@@ -59,6 +63,7 @@ fn run_cli(a: &[String]) {
             "--adb-root" => cleanup = Cleanup::AdbRoot,
             "--skip-magisk" => skip_magisk = true,
             "--verify-root" => verify_root = true,
+            "--local" => local = true,
             "--settle" => { i += 1; let s = a.get(i).unwrap_or_else(|| die("missing settle")); settle_ms = (s.parse::<f64>().unwrap_or_else(|_| die("bad settle")) * 1000.0) as u64; }
             "-h" | "--help" => { println!("{}", USAGE); return; }
             other => die(&format!("unknown arg {}", other)),
@@ -67,8 +72,36 @@ fn run_cli(a: &[String]) {
     }
     let target = target.unwrap_or_else(|| { eprintln!("{}", USAGE); die("missing -t/--target"); });
     log::init();
-    let t = Target::load(&target);
-    orchestrate::run(&t, device.as_deref(), cleanup, verify_root, settle_ms, skip_magisk);
+    // -t may be a .json file OR a directory / "auto" -> auto-pick the target whose build_incremental
+    // matches this build (getprop locally with --local, else via the connected device).
+    let t = resolve_target(&target, local, device.as_deref());
+    orchestrate::run(&t, device.as_deref(), cleanup, verify_root, settle_ms, skip_magisk, local);
+}
+
+/// Resolve -t to a Target: explicit .json, or a directory/"auto" auto-detected by build_incremental.
+fn resolve_target(spec: &str, local: bool, device: Option<&str>) -> Target {
+    use std::path::Path;
+    let is_dir = Path::new(spec).is_dir();
+    if !is_dir && spec != "auto" { return Target::load(spec); }
+    let dir = if spec == "auto" { "targets".to_string() } else { spec.to_string() };
+    let build = {
+        let adb = if local { adb::Adb::new_local() }
+                  else { adb::Adb::new(device.unwrap_or_else(|| die("auto target needs --local or -d <serial>"))) };
+        adb.getprop("ro.build.version.incremental")
+    };
+    if build.is_empty() { die("could not read ro.build.version.incremental for auto target"); }
+    let entries = fs::read_dir(&dir).unwrap_or_else(|e| die(&format!("read targets dir {}: {}", dir, e)));
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("json") { continue; }
+        let txt = match fs::read_to_string(&p) { Ok(x) => x, Err(_) => continue };
+        let j = match json::Json::parse(&txt) { Ok(x) => x, Err(_) => continue };
+        if j.get("device").and_then(|d| d.get("build_incremental")).and_then(|b| b.as_str()) == Some(build.as_str()) {
+            eprintln!("[auto] target {} matches build {}", p.display(), build);
+            return Target::load(&p.to_string_lossy());
+        }
+    }
+    die(&format!("no target in {} matches build {}", dir, build));
 }
 
 fn main() {

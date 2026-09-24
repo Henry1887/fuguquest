@@ -34,6 +34,21 @@ fuguquest -t targets/<name>.json [-d SERIAL] [--settle N] [--verify-root]
 - **Quest 3S / Quest Pro / Quest 2 (merged)** — one carrier does enforcing=0 + cred-patch together;
   Q3S uses a `.text`-splice carrier. See below.
 
+### `--local` — run on-device (one-click-root apps)
+Runs the whole orchestrator **on the device, in the shell domain**, executing every command with
+`sh -c` instead of `adb -s <serial> shell` (no per-command adb round-trips). Intended for an app
+that gets a shell context via an **adb-wireless self-connect** (bundle adb + a paired key, connect
+to `127.0.0.1`), then drives everything with a single:
+```
+adb shell /data/local/tmp/fuguquest --local -t /data/local/tmp/targets --adb-root
+```
+`-t <dir>` (or `auto`) auto-picks the target whose `build_incremental` matches `ro.build.version.incremental`.
+This replaces a C-reimplemented builder + orchestration shell script with the one Rust source of
+truth. Cross-compile: `cd rust && cargo build --release --target aarch64-linux-android` (NDK linker in
+`rust/.cargo/config.toml`). Validated on Q3: full `--local --adb-root` in **~1.25s**, single `adb shell`
+invocation. (The one thing an app can't avoid: a one-time wireless-debug pairing — untrusted_app is
+sepolicy-blocked from `ctl.start insmod_sh` and `dumpsys`, so the chain must reach the shell domain.)
+
 ### `--adb-root` — root adb shells without Magisk
 Cred-patches the running **adbd** to `uid 0 + all caps + kernel SELinux context` and leaves SELinux
 **Permissive**, so every **new** `adb shell` is full root — no Magisk, no Zygisk. Needs
