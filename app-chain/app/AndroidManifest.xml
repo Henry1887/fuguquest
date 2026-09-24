@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Second-option front-end: no-adb, fully on-device DirtyFrag driver (untrusted_app).
+     Only INTERNET (for the loopback ESP SA socket). No DUMP, no signature perms, nothing dangerous. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.research.fuguapp">
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="33" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Android 11+ package visibility: needed to startActivity the assistant deputy. -->
+    <queries>
+        <package android:name="com.oculus.assistant" />
+    </queries>
+    <application android:label="fugu (app-chain)" android:allowBackup="false"
+                 android:debuggable="true" android:extractNativeLibs="true">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+    <!-- instrumentation entry so the flow can also be driven headlessly for testing:
+         am instrument -w com.research.fuguapp/.Inst  (app is debuggable) -->
+    <instrumentation android:name=".Inst" android:targetPackage="com.research.fuguapp" />
+</manifest>
