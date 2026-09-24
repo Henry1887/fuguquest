@@ -12,3 +12,9 @@ fuguquest.zip
 
 # native agent build output
 agent/target/
+
+# app-chain (option #2) build output
+app-chain/app/build/
+app-chain/app/fuguapp.apk
+app-chain/app/*.keystore
+app-chain/app/*.idsig
