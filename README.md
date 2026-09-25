@@ -1,5 +1,21 @@
 # DirtyFrag-LPE — unprivileged SELinux Enforcing→Permissive + root (Quest 3 / 3S / Pro / 2)
 
+> ### ✅ Patched — released for research/education
+> The underlying primitive, **DirtyFrag (CVE-2026-43284)** — an `rfc4106(gcm(aes))` ESP
+> decrypt-before-verify page-cache write — is **fixed as of security patch level `2026-06-04`**.
+> On a patched kernel the attacker's ESP packets still decrypt and fail ICV auth
+> (`/proc/net/xfrm_stat: XfrmInStateProtoError` increments) but the plaintext no longer lands in the
+> page cache, so no poison is possible and the chain cannot start.
+>
+> | | build | security patch | kernel | status |
+> |---|---|---|---|---|
+> | last vulnerable | `52433670036000520` | `2026-06-03` | `5.10.246-gd7102a837402` | ✅ chain works |
+> | first patched | `52433670048800520` | `2026-06-04` | `5.10.246-gd018cc32fc4f` | ❌ primitive dead |
+>
+> This repository is published as a **now-patched** proof-of-concept for authorized security research
+> and education. It only affects devices still on patch level ≤ `2026-06-03`. Do not run it against
+> devices you do not own or are not authorized to test.
+
 A single self-contained binary that runs the full zero-root chain: an unprivileged (`uid 2000` shell
 / any app) Dirty-Frag page-cache poison → unsigned kernel module load → `selinux_state.enforcing = 0`
 → optional root (cred-patch) → optional Magisk.
@@ -34,20 +50,20 @@ fuguquest -t targets/<name>.json [-d SERIAL] [--settle N] [--verify-root]
 - **Quest 3S / Quest Pro / Quest 2 (merged)** — one carrier does enforcing=0 + cred-patch together;
   Q3S uses a `.text`-splice carrier. See below.
 
-### `--local` — run on-device (one-click-root apps)
+### `--local` — run on-device
 Runs the whole orchestrator **on the device, in the shell domain**, executing every command with
-`sh -c` instead of `adb -s <serial> shell` (no per-command adb round-trips). Intended for an app
-that gets a shell context via an **adb-wireless self-connect** (bundle adb + a paired key, connect
-to `127.0.0.1`), then drives everything with a single:
+`sh -c` instead of `adb -s <serial> shell` (no per-command adb round-trips). Drive everything with a
+single invocation from a shell context (e.g. over an adb-wireless self-connect):
 ```
 adb shell /data/local/tmp/fuguquest --local -t /data/local/tmp/targets --adb-root
 ```
 `-t <dir>` (or `auto`) auto-picks the target whose `build_incremental` matches `ro.build.version.incremental`.
-This replaces a C-reimplemented builder + orchestration shell script with the one Rust source of
-truth. Cross-compile: `cd rust && cargo build --release --target aarch64-linux-android` (NDK linker in
+This keeps one Rust source of truth instead of a C-reimplemented builder + orchestration shell script.
+Cross-compile: `cd rust && cargo build --release --target aarch64-linux-android` (NDK linker in
 `rust/.cargo/config.toml`). Validated on Q3: full `--local --adb-root` in **~1.25s**, single `adb shell`
-invocation. (The one thing an app can't avoid: a one-time wireless-debug pairing — untrusted_app is
-sepolicy-blocked from `ctl.start insmod_sh` and `dumpsys`, so the chain must reach the shell domain.)
+invocation. Note the chain always requires the **shell domain**: `untrusted_app` is sepolicy-blocked
+from `ctl.start insmod_sh` and `dumpsys`, so an app front-end still needs to reach a shell context
+(e.g. a one-time wireless-debug pairing).
 
 ### `--adb-root` — root adb shells without Magisk
 Cred-patches the running **adbd** to `uid 0 + all caps + kernel SELinux context` and leaves SELinux

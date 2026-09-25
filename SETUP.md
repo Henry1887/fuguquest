@@ -1,5 +1,9 @@
 # Setup — dependencies (Linux & Windows)
 
+> **Note:** DirtyFrag (CVE-2026-43284) is **patched as of security patch level `2026-06-04`** — see
+> the status table in [README.md](README.md). The chain only works on devices still on patch level
+> ≤ `2026-06-03`. This setup is for building/running the (now-patched) PoC for authorized research.
+
 There are two separate jobs with very different requirements:
 
 | Job | Needs | Notes |
