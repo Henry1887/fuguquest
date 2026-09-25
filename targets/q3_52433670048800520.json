@@ -1,6 +1,7 @@
 {
   "name": "q3_52433670048800520",
-  "description": "build 52433670048800520, kernel 5.10.246-gd018cc32fc4f",
+  "status": "PATCHED",
+  "description": "Quest 3 build 52433670048800520, kernel 5.10.246-gd018cc32fc4f. DirtyFrag (CVE-2026-43284) PATCHED at security_patch 2026-06-04: ESP GCM decrypt-before-verify page-cache write is suppressed. On-device: attacker ESP packets still decrypt+fail-ICV (XfrmInStateProtoError +1/pkt) but plaintext no longer lands in page cache (verified 8 pkts -> +8 proto errors, 0 bytes changed, on both a self-owned file and libandroid_servers.so). Offsets kept for reference only; chain does NOT complete. Last vulnerable build: 52433670036000520 (patch 2026-06-03, kernel gd7102a837402).",
   "device": {
     "build_incremental": "52433670048800520",
     "vermagic": "5.10.246-gd018cc32fc4f"
