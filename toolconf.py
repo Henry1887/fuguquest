@@ -12,10 +12,10 @@ import os, shutil
 
 # --- toolchain bin directories -------------------------------------------------------------------
 # AOSP clang (aarch64-linux-gnu): builds the carrier .ko diff patches + injection/cred asm.
-CLANG_BIN = os.environ.get("AOSP_CLANG_BIN", "/home/henry/Tools/aosp-clang/clang-r450784e/bin")
+CLANG_BIN = os.environ.get("AOSP_CLANG_BIN", os.path.expanduser("~/Tools/aosp-clang/bin"))
 # Android NDK llvm prebuilt bin (aarch64-linux-android*-clang): native PoCs / rebuilding e2e.dex tools.
 NDK_BIN   = os.environ.get("NDK_BIN",
-    "/home/henry/Tools/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin")
+    os.path.expanduser("~/Tools/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"))
 # --- resolver: prefer the configured bin dir, else fall back to the tool on PATH ------------------
 # So it "just works" if clang/llvm are installed and on PATH (e.g. `winget install LLVM.LLVM`) even
 # when AOSP_CLANG_BIN still points at the default. `.exe` is added on Windows. If nothing is found,
@@ -39,6 +39,6 @@ NM        = _tool(CLANG_BIN, "llvm-nm")
 NDK_CLANG = _tool(NDK_BIN, "aarch64-linux-android30-clang")
 
 # --- standalone binaries (env path, else PATH) ---------------------------------------------------
-PDG            = _bin("PAYLOAD_DUMPER", "/home/henry/Tools/payload-dumper-go_1.3.0_linux_amd64/payload-dumper-go", "payload-dumper-go")
+PDG            = _bin("PAYLOAD_DUMPER", os.path.expanduser("~/Tools/payload-dumper-go/payload-dumper-go"), "payload-dumper-go")
 DEBUGFS        = _bin("DEBUGFS", "debugfs", "debugfs")
 VMLINUX_TO_ELF = _bin("VMLINUX_TO_ELF", "vmlinux-to-elf", "vmlinux-to-elf")

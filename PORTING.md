@@ -1,5 +1,14 @@
 # Porting DirtyFrag-LPE to a new firmware (Quest 3 or Quest Pro)
 
+> **Patched builds:** DirtyFrag (CVE-2026-43284) is fixed at security patch level `2026-06-04`
+> (see [README.md](README.md)). `port.py` will still *build a target* from a patched OTA — all the
+> offsets extract fine and the kernel layout looks unchanged — but the **primitive itself is dead**,
+> so the chain won't complete. Offline porting is therefore **not** sufficient to prove a build
+> vulnerable: always confirm the page-cache write actually lands on-device (poison a scratch file in
+> `/data/local/tmp`, read it back — if it's unchanged while `/proc/net/xfrm_stat`'s
+> `XfrmInStateProtoError` still climbs, the build is patched). `targets/q3_52433670048800520.json` is
+> kept as a worked example of a patched target (`"status":"PATCHED"`).
+
 A target is one `targets/<name>.json` + the gathered binaries in `targets/<name>/`. Everything
 version- and device-specific lives in that JSON; the `kernel.merged` flag selects the flow, so the
 **same orchestrator runs Quest 3 and Quest Pro**. See the Quest Pro section below for the merged

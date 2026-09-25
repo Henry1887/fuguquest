@@ -1,2 +1,4 @@
+# Point `linker` at your NDK's aarch64-linux-android<API>-clang, or put that NDK
+# .../toolchains/llvm/prebuilt/<host>/bin on your PATH and keep the bare name below.
 [target.aarch64-linux-android]
-linker = "/home/henry/Tools/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+linker = "aarch64-linux-android30-clang"
