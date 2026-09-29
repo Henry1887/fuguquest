@@ -22,7 +22,7 @@
 import argparse, json, os, re, struct, subprocess, sys, tempfile, shutil, atexit
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from toolconf import READELF, NM, PDG, DEBUGFS, VMLINUX_TO_ELF   # central tool locations (edit toolconf.py / set env)
+from toolconf import READELF, NM, OBJDUMP, PDG, DEBUGFS, VMLINUX_TO_ELF   # central tool locations (edit toolconf.py / set env)
 R_AARCH64_CALL26 = 0x11b
 
 def run(args): return subprocess.run(args, capture_output=True, text=True).stdout   # arg list, no shell (OS-independent)
@@ -107,6 +107,61 @@ def dump_sym(lib, needle):
             f = l.split(); return int(f[1], 16), int(f[2])
     return None, None
 
+# --- old-kernel "another path": derive data/struct offsets by disassembly ------------------------
+# Old Quest 2 kernels (e.g. 4.19.157 on build 5083785006200150) ship a kallsyms with NO data symbols
+# and NO BTF, so `selinux_state` — the only *data* symbol port.py needs — is missing and vmlinux-to-elf
+# can't recover it. We instead xref it out of the code (its address is baked into every SELinux hook):
+# `avc_has_perm_noaudit(&selinux_state, ...)` passes it as x0, so majority-vote the x0 (adrp+add) across
+# every call site. task_struct->cred can likewise shift across 4.19 point-releases (0x7e0 on 4.19.157
+# vs 0x7e8 on 4.19.325), so we can read it straight out of commit_creds. Both need only llvm-objdump.
+def _objdump(vm):
+    return run([OBJDUMP, "-d", "--no-show-raw-insn", vm]).splitlines()
+
+_INSN = re.compile(r"^\s*([0-9a-f]+):\s+(\w+)\s*(.*)$")
+def _disasm_iter(lines):
+    for l in lines:
+        m = _INSN.match(l)
+        if m:
+            yield int(m.group(1), 16), m.group(2), m.group(3).split("//")[0].strip()
+
+def selinux_state_via_xref(vm, avc_addr):
+    """&selinux_state = the x0 passed to avc_has_perm_noaudit, majority-voted over all call sites.
+    Tracks the running x0 (adrp then add #imm); a bl / mov / ldr into x0 invalidates it."""
+    target = f"{avc_addr:x}"
+    x0_page = x0_val = None
+    votes = {}
+    for _addr, mn, ops in _disasm_iter(_objdump(vm)):
+        if mn == "adrp" and ops.startswith("x0,"):
+            m = re.search(r"0x([0-9a-f]+)", ops); x0_page = int(m.group(1), 16) if m else None; x0_val = None
+        elif mn == "add" and ops.startswith("x0, x0, #"):
+            m = re.match(r"x0, x0, #(-?(?:0x[0-9a-f]+|\d+))(?:, lsl #(\d+))?", ops)
+            if m and x0_page is not None:
+                imm = int(m.group(1), 0) << (int(m.group(2)) if m.group(2) else 0)
+                x0_val = x0_page + imm
+        elif mn == "bl":
+            if ops.split()[0].lstrip("#").rstrip(">").split("<")[0].strip().endswith(target) and x0_val is not None:
+                votes[x0_val] = votes.get(x0_val, 0) + 1
+            x0_page = x0_val = None                 # bl clobbers x0 (return value)
+        elif ops[:3] in ("x0,", "w0,"):             # any other write to x0/w0
+            x0_page = x0_val = None
+    if not votes: return None
+    return max(votes.items(), key=lambda kv: kv[1])[0]
+
+def cred_off_via_commit_creds(vm, cc_addr):
+    """task_struct->cred: commit_creds loads current (mrs SP_EL0) then the adjacent real_cred/cred
+    pointer pair (cred = real_cred + 8). Returns cred offset, or None."""
+    cur = None; ldrs = []
+    for addr, mn, ops in _disasm_iter(_objdump(vm)):
+        if addr < cc_addr: continue
+        if addr > cc_addr + 0x200: break
+        if mn == "mrs" and "SP_EL0" in ops: cur = ops.split(",")[0].strip()
+        elif mn == "ldr" and cur:
+            m = re.search(rf"\[{re.escape(cur)}, #(-?(?:0x[0-9a-f]+|\d+))\]", ops)
+            if m: ldrs.append(int(m.group(1), 0))
+    for a in sorted(set(ldrs)):
+        if a + 8 in ldrs: return a + 8              # real_cred @ a, cred @ a+8
+    return None
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--zip", required=True)
@@ -124,7 +179,8 @@ def main():
     ap.add_argument("--enforcing-off", type=lambda x: int(x, 0), default=0,
                     help="selinux_state.enforcing byte offset (5.10=0, 4.19=1; confirm via BTF)")
     ap.add_argument("--cred-off", default="0x778",
-                    help="task_struct->cred offset (5.10=0x778, 4.19=0x7e8; confirm via BTF)")
+                    help="task_struct->cred offset (5.10=0x778, 4.19.325=0x7e8, 4.19.157=0x7e0; "
+                         "'auto' = derive from commit_creds. Always cross-checked against commit_creds.)")
     ap.add_argument("--cred-security-off", default="0x78",
                     help="cred->security offset for --adb-root's kernel-context patch (0x78 on 5.10 & 4.19)")
     ap.add_argument("--cfg-ctor", action="store_true",
@@ -176,17 +232,37 @@ def main():
     vm = os.path.join(wd, "vmlinux.elf")
     subprocess.run([VMLINUX_TO_ELF, os.path.join(wd, "boot.img"), vm], capture_output=True)
     want = ("selinux_state", anchor, "find_vpid", "pid_task", "selinux_status_update_setenforce")
+    # also grab the code symbols used to xref-derive missing data syms on old (data-kallsyms-less) kernels
+    extra = ("avc_has_perm_noaudit", "commit_creds")
     syms = {}
     for l in run([NM, vm]).splitlines():
         f = l.split()
-        if len(f) == 3 and f[2] in want: syms[f[2]] = int(f[0], 16)
+        if len(f) == 3 and f[2] in want + extra: syms[f[2]] = int(f[0], 16)
+    # selinux_state is a *data* symbol; old kernels (4.19.157 Q2) ship no data kallsyms -> xref it out
+    # of the code instead (friend's tip: it's avc_has_perm_noaudit's first arg). See helper above.
+    if "selinux_state" not in syms and "avc_has_perm_noaudit" in syms:
+        ss = selinux_state_via_xref(vm, syms["avc_has_perm_noaudit"])
+        if ss:
+            syms["selinux_state"] = ss
+            print(f"    [xref] selinux_state not in kallsyms -> {ss:#x} (via avc_has_perm_noaudit callers)")
     miss = [s for s in want if s not in syms]
-    if miss: die("missing kernel symbols in vmlinux: " + ",".join(miss))
+    if miss: die("missing kernel symbols in vmlinux: " + ",".join(miss)
+                 + ("  (selinux_state xref needs avc_has_perm_noaudit)" if "selinux_state" in miss else ""))
     pdr = syms[anchor]
     d32 = lambda s: hex((syms[s] - pdr) & 0xffffffff)     # anchor-relative, 32-bit two's complement
     print(f"    {anchor}={pdr:#x} selinux_state={syms['selinux_state']:#x}")
     print(f"    dsel={d32('selinux_state')} dfv={d32('find_vpid')} dpt={d32('pid_task')} "
           f"dssuse={d32('selinux_status_update_setenforce')}")
+
+    # task_struct->cred drifts across 4.19 point-releases (0x7e0 on 4.19.157 vs 0x7e8 on 4.19.325).
+    # Read it out of commit_creds. --cred-off auto = trust the derivation; else cross-check & warn.
+    cc = cred_off_via_commit_creds(vm, syms["commit_creds"]) if "commit_creds" in syms else None
+    if str(a.cred_off).lower() == "auto":
+        if cc is None: die("could not derive cred_off from commit_creds; pass --cred-off explicitly")
+        a.cred_off = hex(cc); print(f"    [derive] task_struct->cred = {a.cred_off} (from commit_creds)")
+    elif cc is not None and cc != int(a.cred_off, 0):
+        print(f"    [!] cred_off cross-check: --cred-off={a.cred_off} but commit_creds reads {hex(cc)} "
+              f"— VERIFY (use --cred-off {hex(cc)} or --cred-off auto if the derivation is right)")
 
     print(f"[*] inject-lib ({a.inject_lib}) / libandroid offsets ...")
     ilib = lib_from_device_or_zip(a.inject_lib, f"/vendor/lib64/{a.inject_lib}", a.device, wd,

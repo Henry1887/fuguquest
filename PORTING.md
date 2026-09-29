@@ -149,3 +149,79 @@ fuguquest -t targets/q3s_<build>.json --adb-root          # or --postex
 Confirm on-device (as with QPro's gralloc injection): `trackingservice` maps `libcdsprpc` and it's
 `same_process_hal_file` (shell-readable). If not, pick another trackingservice-mapped, shell-readable
 lib with a ≥ ~3.7 KB exec gap for `--inject-lib`.
+
+---
+
+## Quest 2 (merged 4.19) — including old builds with no data kallsyms
+
+Quest 2 (`hollywood`) is the **same merged single-carrier shape as Quest Pro** — `rdbg` carrier,
+`libgralloc.qti.so` ctor injection, shell-direct cfg poison. Recent builds (kernel `4.19.325`,
+`52106880xxxxx…52242990xxxxx`) port with the plain QPro invocation:
+
+```
+python3 port.py --zip q2_<build>.zip --merged --carrier rdbg \
+  --inject-lib libgralloc.qti.so --enforcing-off 1 --cred-off 0x7e8
+```
+
+**Old builds need another path.** The oldest dumped build, `50837850062000150`
+(kernel **`4.19.157+`**, security patch `2024-02-05` — well before the DirtyFrag fix, so the primitive
+is live), breaks two of port.py's assumptions. Both are now handled automatically:
+
+1. **`selinux_state` isn't in kallsyms.** This kernel's `/proc/kallsyms` (hence the vmlinux-to-elf
+   symtab) carries **only function symbols — no data symbols — and no BTF**, so `selinux_state`, the
+   one *data* symbol the deltas need, is missing and port.py used to die with
+   `missing kernel symbols in vmlinux: selinux_state`. port.py now **xrefs it out of the code**:
+   `&selinux_state` is baked into every SELinux hook as the first argument (x0) to
+   `avc_has_perm_noaudit(&selinux_state, …)`, so `selinux_state_via_xref()` disassembles the kernel,
+   finds every `bl avc_has_perm_noaudit`, back-tracks the `adrp x0 / add x0,x0,#imm` that set x0, and
+   **majority-votes** the result. On `50837850062000150` all callers agree on `0xffffff800976f8f8`
+   (`selinux_vm_enough_memory` / `cred_has_capability` are the cleanest single-call witnesses). Only
+   `llvm-objdump` is needed; the fallback triggers **only when the symbol is absent**, so 4.19.325 /
+   5.10 ports are byte-for-byte unchanged.
+
+2. **`task_struct->cred` moved.** It's **`0x7e0` on 4.19.157**, not `0x7e8` (4.19.325) — task_struct
+   grew 8 B between the point-releases, so the hard-coded QPro value would cred-patch the wrong pointer
+   and corrupt memory. port.py now reads it straight out of `commit_creds` (`mrs xN, SP_EL0` →
+   current, then the adjacent `real_cred @ a` / `cred @ a+8` load pair). Pass **`--cred-off auto`** to
+   trust the derivation, or an explicit value; either way it's **cross-checked against `commit_creds`**
+   and a mismatch is flagged. (`enforcing_off` stays `1` — `struct selinux_state {bool disabled;
+   bool enforcing; …}` is unchanged; `cred->security` stays `0x78`, confirmed from
+   `cred_has_capability`'s `ldr x8,[x0,#120]`.)
+
+```
+python3 port.py --zip q2_50837850062000150.zip --merged --carrier rdbg \
+  --inject-lib libgralloc.qti.so --enforcing-off 1 --cred-off auto
+# -> [xref] selinux_state not in kallsyms -> 0xffffff800976f8f8 (via avc_has_perm_noaudit callers)
+# -> [derive] task_struct->cred = 0x7e0 (from commit_creds)
+```
+
+The carrier (`rdbg`, 676 B `.init.text`, `__platform_driver_register` anchor), the cfg
+(`modprobe|-b *`, identical to newer builds) and `libandroid_servers.so` (dump stub target) all
+extract normally — only the kernel-side symbol/offset recovery differed there.
+
+**Userspace injection still needs on-device work on this build** (kernel offsets are done and
+self-consistent; the ctor-injection front-end is not). Two more things changed and are flagged in the
+target's `status` / `port_notes`:
+
+- **The tracking daemon is `trackingfidelityservice`** (`user system`, `group camera`), not
+  `trackingservice`. `services.tracking` is set accordingly. Confirm on-device that a `ctl.restart`
+  re-runs it, that its SELinux domain can `open()` the carrier (`rdbg.ko`, `vendor_file`) for the ESP
+  page-cache poison, and that it maps the `inject_lib` you pick.
+- **No tracking-mapped, shell-readable lib has a big enough exec zero-gap.** The old toolchain packs
+  code tightly, so almost every `vendor`/`system` lib has a 3–8 B exec gap; the full merged ctor stub
+  is ~3500 B (263 diff bytes × 12 + ~344 B). `libgralloc.qti.so` (552 B) and `libcdsprpc.so` (3328 B)
+  both **overflow**. This is now handled by the **split flow** (`fuguquest` auto-selects it when the
+  merged stub won't fit the gap; `"split_flow": true` in the target forces it):
+  - **Phase A** injects a small **enforcing-only** carrier via the tracking-daemon ctor
+    (`build_credmod_ex(enforcing_only)` — 104 B patch → **1904 B stub, fits `libcdsprpc`'s 3328 B
+    gap**), loads it, and reaches Permissive. (Unlike Q3's `build_carrier`, this reuses
+    `build_credmod`'s ABS64-anchor path, so it works on `rdbg`'s 18-CALL26 `.init.text`.)
+  - **Phase B**, now under Permissive/DAC, builds the **full cred carrier** from the same `rdbg`,
+    **renames its module** (`rename_module` → `rdbgcp`) so it coexists with the loaded Phase-A `rdbg`,
+    pushes it to `/data/local/tmp/uv.ko`, poisons the cfg shell-direct to `insmod` it, and
+    `ctl.start insmod_sh` loads it → cred-patch → root. Both patched inits return early (no device
+    registration), so the two modules don't conflict.
+
+  Validate the stub sizes offline with `cargo run --example fitcheck` (defaults to this target).
+  If Phase A's stub still won't fit on some other build, point `inject_lib` at any tracking-mapped,
+  shell-readable lib with a ≥ ~2 KB exec gap.

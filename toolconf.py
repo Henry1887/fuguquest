@@ -36,6 +36,7 @@ CLANG     = _tool(CLANG_BIN, "clang")
 OBJCOPY   = _tool(CLANG_BIN, "llvm-objcopy")
 READELF   = _tool(CLANG_BIN, "llvm-readelf")
 NM        = _tool(CLANG_BIN, "llvm-nm")
+OBJDUMP   = _tool(CLANG_BIN, "llvm-objdump")   # port.py: xref-derive data syms (selinux_state) on old kernels w/o data kallsyms
 NDK_CLANG = _tool(NDK_BIN, "aarch64-linux-android30-clang")
 
 # --- standalone binaries (env path, else PATH) ---------------------------------------------------
