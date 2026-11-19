@@ -33,8 +33,10 @@ pub fn build_carrier(carrier_bytes: Vec<u8>, anchor_reloc_off: u64, delta: u32) 
 }
 
 /// insmod cfg: splice `insmod|<path>\n` + comment padding into the bounded inject region.
+/// If modprobe_kill_off is Some, writes '#' at that offset to disable stock `modprobe|-b *`
+/// which otherwise preloads the stock carrier module before our insmod (Bug 18).
 /// Returns (orig, patched).
-pub fn build_cfg(orig: Vec<u8>, insmod_path: &str, inject_off: usize, inject_len: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
+pub fn build_cfg(orig: Vec<u8>, insmod_path: &str, inject_off: usize, inject_len: usize, modprobe_kill_off: Option<usize>) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut line = Vec::new();
     line.extend_from_slice(b"insmod|");
     line.extend_from_slice(insmod_path.as_bytes());
@@ -48,6 +50,11 @@ pub fn build_cfg(orig: Vec<u8>, insmod_path: &str, inject_off: usize, inject_len
     if newblk.len() != inject_len { return Err("cfg block size mismatch".into()); }
     let mut patched = orig.clone();
     patched[inject_off..inject_off + inject_len].copy_from_slice(&newblk);
+    if let Some(kill_off) = modprobe_kill_off {
+        if kill_off < patched.len() {
+            patched[kill_off] = b'#';
+        }
+    }
     Ok((orig, patched))
 }
 

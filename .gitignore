@@ -6,9 +6,13 @@ __pycache__/
 *.bin
 *.spec
 
+# but keep target-specific spec/bin files (pre-built, not generated)
+!targets/**/*.bin
+
 # Rust build output (fuguquest)
 rust/target/
 fuguquest.zip
 
 # native agent build output
 agent/target/
+.vs/

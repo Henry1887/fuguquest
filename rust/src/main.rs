@@ -133,7 +133,8 @@ fn main() {
         }
         "emit-cfg" => {
             let orig = fs::read(&a[2]).unwrap();
-            let (_o, patched) = credmod::build_cfg(orig, &a[4], i64a(&a[5]) as usize, i64a(&a[6]) as usize).unwrap_or_else(|e| die(&e));
+            let kill = if a.len() > 7 { Some(i64a(&a[7]) as usize) } else { None };
+            let (_o, patched) = credmod::build_cfg(orig, &a[4], i64a(&a[5]) as usize, i64a(&a[6]) as usize, kill).unwrap_or_else(|e| die(&e));
             fs::write(&a[3], &patched).unwrap();
             eprintln!("cfg written {} bytes", patched.len());
         }
@@ -152,7 +153,7 @@ fn main() {
             let (raw, spec, cnts) = emit::build_inject_stub(
                 i64a(&a[4]) as u32, i64a(&a[5]) as u8, i64a(&a[6]) as u16,
                 i64a(&a[7]) as u64, i64a(&a[8]) as usize, i64a(&a[9]) as u64, i64a(&a[10]) as u64,
-                &files).unwrap_or_else(|e| die(&e));
+                &files, false).unwrap_or_else(|e| die(&e));
             fs::write(&a[2], &raw).unwrap();
             fs::write(&a[3], &spec).unwrap();
             eprintln!("stub {} bytes cnts={:?}", raw.len(), cnts);

