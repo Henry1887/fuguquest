@@ -198,10 +198,10 @@ def main():
 
     # system (1.2GB) is only needed to pull libandroid_servers from the OTA; skip it if a device is
     # connected (we adb-pull that lib instead). vendor_dlkm is absent on QPro — payload-dumper skips it.
-    parts = ["boot", "vendor", "vendor_dlkm"] + ([] if a.device else ["system"])
+    parts = ["boot", "vendor", "vendor_dlkm", "system_ext"] + ([] if a.device else ["system"])
     print("[*] dumping " + ", ".join(parts) + " ...")
     dump_partitions(a.zip, wd, parts)
-    IMGS = ["vendor.img", "vendor_dlkm.img"]           # QPro: vendor; Q3: vendor_dlkm — try both
+    IMGS = ["vendor.img", "vendor_dlkm.img", "system_ext.img"]           # QPro: vendor; Q3: vendor_dlkm — try both
 
     print(f"[*] extracting carrier ({a.carrier}) + cfg ...")
     ko = find_module(wd, a.carrier, IMGS)
@@ -265,8 +265,8 @@ def main():
               f"— VERIFY (use --cred-off {hex(cc)} or --cred-off auto if the derivation is right)")
 
     print(f"[*] inject-lib ({a.inject_lib}) / libandroid offsets ...")
-    ilib = lib_from_device_or_zip(a.inject_lib, f"/vendor/lib64/{a.inject_lib}", a.device, wd,
-                                  [os.path.join(wd, i) for i in IMGS], [f"/lib64/{a.inject_lib}"] * 2)
+    ilib = lib_from_device_or_zip(a.inject_lib, f"/system_ext/lib64/{a.inject_lib}", a.device, wd,
+                                  [os.path.join(wd, i) for i in IMGS], [f"/lib64/{a.inject_lib}"] * len(IMGS))
     # system.img is system-as-root (rooted at /) so the path inside it is /system/lib64/... ; a device
     # pull uses the same absolute path. Try both rootings so it works regardless of image layout.
     libas = lib_from_device_or_zip("libandroid_servers.so", "/system/lib64/libandroid_servers.so",
@@ -308,7 +308,7 @@ def main():
         "kernel": kernel,
         "carrier": {"device_path": f"/vendor/lib/modules/{a.carrier}.ko",
                     "local_ko": f"{a.name}/{a.carrier}.ko", "anchor_reloc_off": "0x14"},
-        "inject_lib": {"device_path": f"/vendor/lib64/{a.inject_lib}", "init_array_off": hex(ia_off),
+        "inject_lib": {"device_path": f"/system_ext/lib64/{a.inject_lib}", "init_array_off": hex(ia_off),
                        "orig_ctor_off": hex(ctor), "stub_gap_off": hex(gap_off), "stub_gap_size": gap_sz},
         "libandroid_servers": {"device_path": "/system/lib64/libandroid_servers.so",
                                "dump_off": hex(dump_off), "dump_size": dump_sz},

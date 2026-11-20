@@ -221,10 +221,10 @@ pub fn run(t: &Target, device_override: Option<&str>, cleanup: Cleanup, verify_r
     let tsvc = t.s(&["services", "tracking"]);
     let isvc = t.s(&["services", "insmod_sh"]);
     step(&format!("dumpsys input  ->  system_server restarts {}  ->  ctor poisons carrier + cfg", tsvc));
-    let pid0 = adb.sh(&format!("pidof {}", tsvc));
+    let pid0 = adb.sh(&format!("pidof {} || pidof {}-service", tsvc, tsvc));
     adb.sh("dumpsys input >/dev/null 2>&1");
     let mut pid1 = pid0.clone();
-    for _ in 0..180 { ms(100); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
+    for _ in 0..180 { ms(100); pid1 = adb.sh(&format!("pidof {} || pidof {}-service", tsvc, tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
     if pid1 == pid0 || pid1.is_empty() { stager.stop(); die(&format!("{} did not restart (pid still {}) — dump stub not hit", tsvc, pid0)); }
     ok(&format!("{} restarted  pid {} -> {}", tsvc, pid0, pid1));
     info(&format!("settling {}ms for the ctor's carrier/cfg poison to complete", settle_ms));
@@ -478,10 +478,10 @@ pub fn run_merged(t: &Target, device_override: Option<&str>, cleanup: Cleanup, _
     let tsvc = t.s(&["services", "tracking"]);
     let isvc = t.s(&["services", "insmod_sh"]);
     step(&format!("dumpsys input  ->  system_server restarts {}  ->  ctor poisons carrier", tsvc));
-    let pid0 = adb.sh(&format!("pidof {}", tsvc));
+    let pid0 = adb.sh(&format!("pidof {} || pidof {}-service", tsvc, tsvc));
     adb.sh("dumpsys input >/dev/null 2>&1");
     let mut pid1 = pid0.clone();
-    for _ in 0..200 { ms(100); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
+    for _ in 0..200 { ms(100); pid1 = adb.sh(&format!("pidof {} || pidof {}-service", tsvc, tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
     if pid1 == pid0 || pid1.is_empty() {
         err(&format!("{} did not restart (pid still {}) — dump stub not hit", tsvc, pid0));
         do_revert(&adb, &workdir, &mut reverted); stager.stop();
@@ -656,10 +656,10 @@ fn run_merged_split(t: &Target, serial: &str, adb: &Adb, cleanup: Cleanup, settl
     let tsvc = t.s(&["services", "tracking"]);
     let isvc = t.s(&["services", "insmod_sh"]);
     step(&format!("dumpsys input  ->  system_server restarts {}  ->  ctor poisons carrier", tsvc));
-    let pid0 = adb.sh(&format!("pidof {}", tsvc));
+    let pid0 = adb.sh(&format!("pidof {} || pidof {}-service", tsvc, tsvc));
     adb.sh("dumpsys input >/dev/null 2>&1");
     let mut pid1 = pid0.clone();
-    for _ in 0..200 { ms(100); pid1 = adb.sh(&format!("pidof {}", tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
+    for _ in 0..200 { ms(100); pid1 = adb.sh(&format!("pidof {} || pidof {}-service", tsvc, tsvc)); if !pid1.is_empty() && pid1 != pid0 { break; } }
     if pid1 == pid0 || pid1.is_empty() {
         err(&format!("{} did not restart (pid still {}) — dump stub not hit", tsvc, pid0));
         do_revert(adb, workdir, &mut reverted); stager.stop(); return;
