@@ -14,4 +14,4 @@ python3 -m venv /opt/v
 export PATH="/opt/v/bin:$PATH"
 
 cd /work
-/opt/v/bin/python port.py --zip QPro_50849480091200340.zip --name QPro_50849480091200340_engines --merged --carrier rdbg --inject-lib libtrackingengines.so --enforcing-off 1 --cred-off auto
+/opt/v/bin/python port.py --zip QPro_50849480091200340.zip --merged --carrier rdbg --inject-lib libgralloc.qti.so --enforcing-off 1 --cred-off auto
