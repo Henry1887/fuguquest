@@ -47,7 +47,7 @@
     "shell_poison_under_enforcing": true
   },
   "services": {
-    "tracking": "trackingservice",
+    "tracking": "vendor.qti.hardware.display.composer",
     "insmod_sh": "insmod_sh"
   },
   "property_socket": "/dev/socket/property_service"
