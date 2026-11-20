@@ -12,3 +12,7 @@ fuguquest.zip
 
 # native agent build output
 agent/target/
+
+# port scratch
+QPro_*.zip
+port/tools/*.tar.gz
