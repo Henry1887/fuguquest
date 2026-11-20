@@ -1,5 +1,6 @@
 {
   "name": "QPro_50849480091200340",
+  "split_flow": true,
   "description": "build 50849480091200340, kernel 4.19.315-cip110-16097-g764e0a2a6b89 (MERGED single-carrier)",
   "device": {
     "build_incremental": "50849480091200340",
