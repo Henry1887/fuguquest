@@ -23,7 +23,7 @@
     "delta_ssuse_from_anchor": "0xffd20bc4"
   },
   "carrier": {
-    "device_path": "/data/local/tmp/rdbg_orig.ko",
+    "device_path": "/vendor/lib/modules/rdbg.ko",
     "local_ko": "QPro_50849480091200340/rdbg.ko",
     "anchor_reloc_off": "0x14"
   },
